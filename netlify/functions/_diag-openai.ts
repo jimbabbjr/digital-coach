@@ -5,11 +5,12 @@ import OpenAI from "openai";
 export const handler: Handler = async () => {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    // so you can read these in the browser Network tab
     "Access-Control-Expose-Headers": "X-Err, X-Err-Message, X-Req-Id, X-Status",
   };
 
   try {
-    const apiKey = (process.env.OPENAI_API_KEY || "").trim(); // <-- trim whitespace/newlines
+    const apiKey = (process.env.OPENAI_API_KEY || "").trim(); // ← trims stray whitespace/newlines
     if (!apiKey) throw new Error("OPENAI_API_KEY missing");
 
     const model = (process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini").trim();
@@ -17,7 +18,7 @@ export const handler: Handler = async () => {
     const oai = new OpenAI({ apiKey });
     const r = await oai.responses.create({ model, input: "Say 'pong' once." });
 
-    headers["X-Req-Id"] = String((r as any)._request_id || ""); // SDK exposes _request_id
+    headers["X-Req-Id"] = String((r as any)?._request_id || "");
     headers["X-Status"] = "200";
 
     return {
@@ -25,7 +26,7 @@ export const handler: Handler = async () => {
       headers,
       body: JSON.stringify({
         ok: true,
-        keyPreview: `${apiKey.slice(0,7)}…${apiKey.slice(-4)} (len ${apiKey.length})`,
+        keyPreview: `${apiKey.slice(0, 7)}…${apiKey.slice(-4)} (len ${apiKey.length})`,
         modelUsed: r.model ?? model,
         text: r.output_text?.slice(0, 80) ?? null,
       }),
@@ -37,6 +38,16 @@ export const handler: Handler = async () => {
     headers["X-Err-Message"] = String(e?.message ?? e?.error?.message ?? "");
     if (e?.request_id) headers["X-Req-Id"] = String(e.request_id);
 
-    return { statusCode: 500, headers, body: JSON.stringify({ ok: false }) };
+    // put the message in the body too so you don’t have to read headers
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({
+        ok: false,
+        status,
+        name: headers["X-Err"],
+        message: headers["X-Err-Message"],
+      }),
+    };
   }
 };
