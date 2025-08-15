@@ -9,13 +9,14 @@
 
 # Make /api/* hit your functions
 [[redirects]]
-from = "/api/chat"
-to = "/.netlify/functions/chat_v2"
-status = 200
+  from = "/api/chat"
+  to   = "/.netlify/functions/chat_v2"
+  status = 200
+  force  = true
 
 [[redirects]]
   from = "/api/*"
-  to = "/.netlify/functions/:splat"
+  to   = "/.netlify/functions/:splat"
   status = 200
 
 
