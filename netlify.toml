@@ -19,6 +19,12 @@
   to   = "/.netlify/functions/:splat"
   status = 200
 
+  [[redirects]]
+  from = "/api/events"
+  to   = "/.netlify/functions/events-get"
+  status = 200
+  force  = true
+
 
 [[headers]]
   for = "/index.html"
