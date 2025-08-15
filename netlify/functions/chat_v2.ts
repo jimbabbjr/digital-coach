@@ -220,6 +220,84 @@ export const handler: Handler = async (event) => {
       };
     }
 
+    // ---- SIM MODE: run policy/tool selection without calling agents/OpenAI ----
+if (mode === "sim") {
+  // registry + allowlist (works if Supabase is configured)
+  let tools = await getToolRegistry();
+
+  // fallback for local/dev without Supabase data
+  if (!tools.length) {
+    tools = [
+      {
+        slug: "weekly-report",
+        title: "Weekly Report",
+        keywords: "weekly,report,updates",
+        patterns: "weekly\\s+report",
+        enabled: true
+      } as any
+    ];
+  }
+
+  const allow = buildAllowlist(tools);
+
+  // Try to pick a tool from the user's text; else craft a body that exercises sanitizers
+  const chosen = matchToolByIntent(userText, tools);
+
+  let bodyText: string;
+  let route = "coach";
+  let recoSlug: string | null = null;
+
+  if (chosen) {
+    route = "tools";
+    bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
+    recoSlug = (chosen as any).slug || null;
+  } else {
+    // include external brands + a rogue Try line to verify policy stripping
+    const rogue = [
+      "Use Asana or ClickUp for this: https://example.com",
+      "Alternatively, Microsoft Teams could work.",
+      "Try: Random External Tool"
+    ].join("\n");
+
+    // sanitize like the real non-tools path
+    bodyText = removeExternalToolMentions(stripAllTryLines(rogue), allow);
+  }
+
+  // headers like normal
+  headers["X-Route"] = route;
+  headers["X-RAG"] = "false";
+  headers["X-RAG-Count"] = "0";
+  headers["X-Reco"] = String(!!recoSlug);
+  if (recoSlug) headers["X-Reco-Slug"] = recoSlug;
+  headers["X-Duration-Total"] = String(Date.now() - t0);
+  headers["X-Events-Stage"] = "success";
+
+  // telemetry (optional)
+  try {
+    if (!sb) {
+      headers["X-Events"] = "no-sb";
+    } else {
+      const { error } = await sb.from("events").insert({
+        ts: new Date().toISOString(),
+        q: userText.slice(0, 500),
+        route,
+        rag_count: 0,
+        rag_mode: null,
+        model: null,
+        reco_slug: recoSlug,
+        duration_ms: Date.now() - t0,
+        ok: true
+      });
+      headers["X-Events"] = error ? "err" : "ok";
+      if (error) headers["X-Events-Err"] = String((error as any).code || "insert_error");
+    }
+  } catch {
+    headers["X-Events"] = "threw";
+  }
+
+  return { statusCode: 200, headers, body: bodyText.trim() };
+}
+
     // ---- route & run ----
     const decision = await pickRoute(userText, clientMessages as any);
 
