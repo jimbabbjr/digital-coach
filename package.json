@@ -22,8 +22,10 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",
+    "@netlify/functions": "^4.2.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/node": "^24.3.0",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
