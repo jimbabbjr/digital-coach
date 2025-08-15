@@ -17,6 +17,11 @@ export const handler: Handler = async () => {
 
     const oai = new OpenAI({ apiKey });
     const r = await oai.responses.create({ model, input: "Say 'pong' once." });
+    const resp = await fetch("https://api.openai.com/v1/models", {
+  headers: { Authorization: `Bearer ${apiKey}` }
+});
+return { statusCode: 200, body: JSON.stringify({ probeStatus: resp.status }) };
+
 
     headers["X-Req-Id"] = String((r as any)?._request_id || "");
     headers["X-Status"] = "200";
