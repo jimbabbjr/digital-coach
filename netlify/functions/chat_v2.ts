@@ -6,10 +6,7 @@ import { route as pickRoute } from "./lib/agents/router";
 import { QaAgent } from "./lib/agents/qa";
 import { CoachAgent } from "./lib/agents/coach";
 import { ToolsAgent } from "./lib/agents/tools";
-import { fetchToolRegistryFlexible, type ToolDocNorm } from "./lib/tools_flex";
 
-
-import type { ToolDoc } from "./lib/tools";
 import {
   buildAllowlist,
   stripAllTryLines,
@@ -34,20 +31,25 @@ const sb =
 // Helpers (policy-safe)
 // ---------------------------
 
-/** Fetch enabled tools (minimal columns) */
-/** Fetch enabled tools using flexible mapping (no schema assumptions) */
-async function getToolRegistry(): Promise<ToolDocNorm[]> {
-  return await fetchToolRegistryFlexible(sb as any);
+/** Canonical Try line */
+function formatTryLine(t: { title: string }) {
+  return `Try: ${t.title}`;
 }
 
-/** 5 min in-memory cache */
-let TOOL_CACHE: { data: ToolDocNorm[]; ts: number } | null = null;
-async function getToolRegistryCached(): Promise<ToolDocNorm[]> {
-  const now = Date.now();
-  if (TOOL_CACHE && now - TOOL_CACHE.ts < 5 * 60_000) return TOOL_CACHE.data;
-  const data = await getToolRegistry();
-  TOOL_CACHE = { data, ts: now };
-  return data;
+/** House plan text (safe, internal) */
+function renderPlanForTool(tool: { title: string; outcome?: string | null }) {
+  const outcome = tool.outcome || "reliable weekly signal without manual chasing";
+  return [
+    `Here’s the fastest path using **${tool.title}**:`,
+    "",
+    "- **Set the rhythm:** Pick one submission deadline (e.g., Fridays 3pm).",
+    "- **Use the built-in template:** Wins, blockers, next week.",
+    "- **Auto-nudge once:** A single reminder before the deadline.",
+    "- **Model the habit:** Post your own update first.",
+    "- **Close the loop:** Share highlights weekly to show value.",
+    "",
+    `Result: ${outcome}.`,
+  ].join("\n");
 }
 
 /** normalize for fuzzy checks */
@@ -69,85 +71,180 @@ function tokenOverlap(a: string, b: string): number {
   return overlap / Math.max(A.size, B.size);
 }
 
-/** regex+keyword scoring; returns best enabled tool or null */
-function matchToolByIntent(userText: string, tools: ToolDoc[]): ToolDoc | null {
+function toList(x: unknown): string[] {
+  if (Array.isArray(x)) return x.map((v) => String(v).trim()).filter(Boolean);
+  if (x == null) return [];
+  const s = String(x);
+  if (s.startsWith("{") && s.endsWith("}")) {
+    // pg text[] string form -> {a,b}
+    return s
+      .slice(1, -1)
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean);
+  }
+  return s.split(",").map((v) => v.trim()).filter(Boolean);
+}
+function kebab(s?: string | null) {
+  return String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function coalesce<T>(...vals: T[]): T | undefined {
+  for (const v of vals) if (v !== undefined && v !== null && String(v) !== "") return v;
+  return undefined;
+}
+function isEnabledRow(row: any): boolean {
+  const v = row?.enabled ?? row?.is_enabled ?? row?.active ?? row?.is_active ?? row?.status;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") return ["1", "true", "t", "y", "yes", "active", "enabled"].includes(v.toLowerCase());
+  if (typeof v === "number") return v > 0;
+  return true;
+}
+
+type ToolRow = {
+  slug: string;
+  title: string;
+  summary?: string | null;
+  why?: string | null;
+  outcome?: string | null;
+  content?: string | null;
+  keywords?: string[] | string | null;
+  patterns?: string[] | string | null;
+  enabled: boolean;
+};
+
+/** Normalize one raw DB row into the shape the app expects (schema-agnostic). */
+function normalizeToolRow(row: any): ToolRow | null {
+  if (!row) return null;
+
+  const title =
+    (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) || "";
+  const slug =
+    (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) || "";
+  if (!title || !slug) return null;
+
+  const summary = coalesce<string>(row.summary, row.primary_use, row.description) ?? null;
+  const why = coalesce<string>(row.why, row.value_prop, row.reason) ?? null;
+  const outcome = coalesce<string>(row.outcome, row.result) ?? null;
+  const content = (row.content != null ? String(row.content) : null) ?? null;
+
+  const keywords = toList(row.keywords ?? row.tags ?? row.search_terms);
+  const patterns = toList(row.patterns ?? row.regex ?? row.matchers);
+
+  return {
+    slug,
+    title,
+    summary,
+    why,
+    outcome,
+    content,
+    keywords: keywords.length ? keywords : null,
+    patterns: patterns.length ? patterns : null,
+    enabled: isEnabledRow(row),
+  };
+}
+
+/** Fetch tools using a broad select and normalize to the contract this app needs. */
+async function getToolRegistry(): Promise<ToolRow[]> {
+  if (!sb) return [];
+  const { data } = await sb.from("tool_docs").select("*");
+  const out: ToolRow[] = [];
+  for (const row of (data || []) as any[]) {
+    const t = normalizeToolRow(row);
+    if (t && t.enabled) out.push(t);
+  }
+  return out;
+}
+
+/** 5 min in-memory cache for tool registry */
+let TOOL_CACHE: { data: ToolRow[]; ts: number } | null = null;
+async function getToolRegistryCached(): Promise<ToolRow[]> {
+  const now = Date.now();
+  if (TOOL_CACHE && now - TOOL_CACHE.ts < 5 * 60_000) return TOOL_CACHE.data;
+  const data = await getToolRegistry();
+  TOOL_CACHE = { data, ts: now };
+  return data;
+}
+
+/**
+ * Smart intent match:
+ * - patterns (regex) → strong signal
+ * - keywords overlap
+ * - lexical overlap with title/summary/primary_use/content (handles legacy schemas)
+ * - tiny hand-tuned boost for common phrases like "weekly report"
+ */
+function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
   const text = String(userText || "");
-  let best: { tool: ToolDoc; score: number } | null = null;
+  const lower = text.toLowerCase();
+
+  // quick phrase heuristics
+  const hasWeeklyReport = /\bweekly\b.*\b(report|updates?)\b/i.test(text);
+
+  let best: { tool: ToolRow; score: number } | null = null;
 
   for (const t of tools) {
-    if (!(t as any)?.enabled || !t?.title) continue;
+    // title required
+    const title = t.title?.trim();
+    if (!title) continue;
 
-    // patterns: csv/array of regex strings
+    const summary = t.summary?.trim() || "";
+    const why = t.why?.trim() || "";
+    const outcome = t.outcome?.trim() || "";
+    const content = t.content?.trim() || "";
+
+    const haystack = [title, summary, why, outcome, content].map(norm).join(" ");
+    const user = norm(text);
+
+    // patterns (regex strings)
+    const rawPatterns = Array.isArray(t.patterns) ? t.patterns : toList(t.patterns);
     let patternHits = 0;
-    const rawPatterns =
-      Array.isArray((t as any).patterns)
-        ? (t as any).patterns
-        : String((t as any).patterns || "")
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean);
-
     for (const rx of rawPatterns) {
       try {
         if (new RegExp(rx, "i").test(text)) patternHits++;
       } catch {}
     }
 
-    // keywords: csv/array
-    const kws =
-      Array.isArray((t as any).keywords)
-        ? (t as any).keywords
-        : String((t as any).keywords || "")
-            .split(",")
-            .map((s) => s.trim().toLowerCase())
-            .filter(Boolean);
-
+    // keywords (strings/array)
+    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) =>
+      s.toLowerCase()
+    );
     let kwHits = 0;
-    const lower = text.toLowerCase();
     for (const k of kws) if (k && lower.includes(k)) kwHits++;
 
-    const score = patternHits * 2 + kwHits;
+    // lexical overlap via token intersection (Jaccard-like)
+    const A = new Set(user.split(" ").filter(Boolean));
+    const B = new Set(haystack.split(" ").filter(Boolean));
+    let overlap = 0;
+    for (const w of A) if (B.has(w)) overlap++;
+    const lex = B.size ? overlap / Math.max(A.size, B.size) : 0;
+
+    // score
+    let score = patternHits * 2 + kwHits + lex * 3;
+
+    // small hand-tuned boost for "weekly report"-ish prompts when title mentions it
+    if (hasWeeklyReport && /\bweekly\b.*\b(report|updates?)\b/.test(title.toLowerCase())) score += 3;
+
     if (!best || score > best.score) best = { tool: t, score };
   }
 
-  if (!best || best.score <= 0) return null;
+  // require some signal but keep the bar low so legacy rows match
+  if (!best || best.score < 1.0) return null;
   return best.tool;
 }
 
 /** Parse "Try: <candidate>" from assistant text and map to known tool via fuzzy title match */
-function detectToolFromAssistant(assistantText: string, tools: ToolDoc[]): ToolDoc | null {
+function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolRow | null {
   if (!assistantText) return null;
   const m = assistantText.match(/^\s*Try\s*:\s*(.+)$/im);
   const candidate = m?.[1]?.trim();
   if (!candidate) return null;
 
-  // exact or fuzzy title match (>= 0.7 overlap)
-  let best: { tool: ToolDoc; score: number } | null = null;
+  let best: { tool: ToolRow; score: number } | null = null;
   for (const t of tools) {
-    const s = norm((t as any).title) === norm(candidate) ? 1 : tokenOverlap((t as any).title, candidate);
+    const s = norm(t.title) === norm(candidate) ? 1 : tokenOverlap(t.title, candidate);
     if (!best || s > best.score) best = { tool: t, score: s };
   }
   if (best && best.score >= 0.7) return best.tool;
   return null;
-}
-
-/** Canonical Try line */
-function formatTryLine(t: ToolDoc) { return `Try: ${(t as any).title}`; }
-
-/** House plan text (safe, internal) */
-function renderPlanForTool(tool: ToolDoc): string {
-  const outcome = (tool as any).outcome || "reliable weekly signal without manual chasing";
-  return [
-    `Here’s the fastest path using **${(tool as any).title}**:`,
-    "",
-    "- **Set the rhythm:** Pick one submission deadline (e.g., Fridays 3pm).",
-    "- **Use the built-in template:** Wins, blockers, next week.",
-    "- **Auto-nudge once:** A single reminder before the deadline.",
-    "- **Model the habit:** Post your own update first.",
-    "- **Close the loop:** Share highlights weekly to show value.",
-    "",
-    `Result: ${outcome}.`,
-  ].join("\n");
 }
 
 // ---- session memory helpers ----
@@ -171,7 +268,10 @@ async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | 
       slots: mem.slots ?? {},
       updated_at: new Date().toISOString(),
     })
-    .then(() => {}, () => {});
+    .then(
+      () => {},
+      () => {}
+    );
 }
 
 // ---------------------------
@@ -184,7 +284,10 @@ const agents = { qa: QaAgent, coach: CoachAgent, tools: ToolsAgent } as const;
 // ---------------------------
 export const handler: Handler = async (event) => {
   const t0 = Date.now();
-  let tAfterRoute = 0, tAfterAgent = 0, tAfterPolicy = 0, tAfterTelemetry = 0;
+  let tAfterRoute = 0,
+    tAfterAgent = 0,
+    tAfterPolicy = 0,
+    tAfterTelemetry = 0;
 
   // debug flags
   const POLICY_VERSION = "int-tools-hard-override-v1";
@@ -197,7 +300,7 @@ export const handler: Handler = async (event) => {
   const headers: Record<string, string> = {
     "Content-Type": "text/plain; charset=utf-8",
     "Access-Control-Expose-Headers":
-      "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing",
+      "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing, X-Tools-Len",
     "X-Policy-Version": POLICY_VERSION,
     "X-Debug-Stamp": DEBUG_STAMP,
   };
@@ -268,18 +371,9 @@ export const handler: Handler = async (event) => {
     // ---- SIM MODE: run policy/tool selection without calling agents/OpenAI ----
     if (mode === "sim") {
       let tools = await getToolRegistryCached();
-      if (!tools.length) {
-        tools = [
-          {
-            slug: "weekly-report",
-            title: "Weekly Report",
-            keywords: "weekly,report,updates",
-            patterns: "weekly\\s+report",
-            enabled: true,
-          } as any,
-        ];
-      }
+      headers["X-Tools-Len"] = String(tools.length);
 
+      // if the registry is empty, we won't fabricate a fake tool; we instead let policy clean guidance
       const allow = buildAllowlist(tools);
       const chosen = matchToolByIntent(userText, tools);
 
@@ -290,7 +384,7 @@ export const handler: Handler = async (event) => {
       if (chosen) {
         route = "tools";
         bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
-        recoSlug = (chosen as any).slug || null;
+        recoSlug = chosen.slug || null;
         await setSessionMem(sessionId, { last_reco_slug: recoSlug, slots: mem.slots });
       } else {
         const rogue = [
@@ -305,7 +399,7 @@ export const handler: Handler = async (event) => {
       headers["X-RAG"] = "false";
       headers["X-RAG-Count"] = "0";
       headers["X-Reco"] = String(!!recoSlug);
-      if (recoSlug) headers["X-Reco-Slug"] = recoSlug;
+      if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
 
       // fire-and-forget telemetry
       if (sb) {
@@ -320,7 +414,10 @@ export const handler: Handler = async (event) => {
           duration_ms: Date.now() - t0,
           ok: true,
         };
-        void sb.from("events").insert(row).then(() => {}, () => {});
+        void sb.from("events").insert(row).then(
+          () => {},
+          () => {}
+        );
         headers["X-Events"] = "queued";
       } else {
         headers["X-Events"] = "no-sb";
@@ -335,13 +432,14 @@ export const handler: Handler = async (event) => {
     // ---- Affirmative follow-up maps to last recommendation if present ----
     if (isAffirmativeFollowUp(userText) && mem.last_reco_slug) {
       const tools = await getToolRegistryCached();
-      const chosen = tools.find((t) => (t as any).slug === mem.last_reco_slug) || null;
+      headers["X-Tools-Len"] = String(tools.length);
+      const chosen = tools.find((t) => t.slug === mem.last_reco_slug) || null;
 
       if (chosen) {
         const finalText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
-        headers["X-Reco-Slug"] = String((chosen as any).slug || "");
+        headers["X-Reco-Slug"] = String(chosen.slug || "");
         headers["X-RAG"] = "false";
         headers["X-RAG-Count"] = "0";
 
@@ -354,18 +452,20 @@ export const handler: Handler = async (event) => {
             rag_count: 0,
             rag_mode: null,
             model: null,
-            reco_slug: (chosen as any).slug || null,
+            reco_slug: chosen.slug || null,
             duration_ms: Date.now() - t0,
             ok: true,
           };
-          void sb.from("events").insert(row).then(() => {}, () => {});
+          void sb.from("events").insert(row).then(
+            () => {},
+            () => {}
+          );
           headers["X-Events"] = "queued";
         } else headers["X-Events"] = "no-sb";
 
         headers["X-Events-Stage"] = "success";
         headers["X-Duration-Total"] = String(Date.now() - t0);
         headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
-        // keep same memory slug
         await setSessionMem(sessionId, { last_reco_slug: mem.last_reco_slug, slots: mem.slots });
         return { statusCode: 200, headers, body: finalText.trim() };
       }
@@ -375,7 +475,13 @@ export const handler: Handler = async (event) => {
     let decision: any = null;
     try {
       const tools = await getToolRegistryCached();
-      const candidates = getCandidatesFromTools(tools, userText, 6);
+      headers["X-Tools-Len"] = String(tools.length);
+      const candidates = getCandidatesFromTools(
+        // map to what router_v2 expects
+        tools.map((t) => ({ ...t, enabled: true })) as any,
+        userText,
+        6
+      );
       const scored = await scoreRouteLLM({
         apiKey: process.env.OPENAI_API_KEY,
         model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
@@ -384,7 +490,9 @@ export const handler: Handler = async (event) => {
         candidates,
         lastRecoSlug: mem.last_reco_slug,
       });
-      if (scored) {
+      if (scored && typeof scored.tool_intent_score === "number" && scored.tool_intent_score < 0.45) {
+        // ignore low-confidence tool picks
+      } else if (scored) {
         decision = {
           route: scored.route,
           ragSpans: [],
@@ -407,12 +515,15 @@ export const handler: Handler = async (event) => {
 
     // ---- tool enforcement (hard override, internal only) ----
     const tools = await getToolRegistryCached();
-    const allow = buildAllowlist(tools || []);
+    headers["X-Tools-Len"] = String(tools.length);
+    const allow = buildAllowlist(
+      tools.map((t) => ({ title: t.title })) as any // buildAllowlist expects titles
+    );
 
     // Prefer LLM-picked slug if present; else intent; else Try-line in assistant text
-    let chosen: ToolDoc | null = null;
+    let chosen: ToolRow | null = null;
     if (decision?.best_tool_slug) {
-      chosen = tools.find((t) => (t as any).slug === decision.best_tool_slug) || null;
+      chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
     }
     if (!chosen) chosen = matchToolByIntent(userText, tools);
     if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
@@ -422,7 +533,9 @@ export const handler: Handler = async (event) => {
 
     if (chosen) {
       finalText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`.trim();
-      recoSlug = (chosen as any).slug || null;
+      recoSlug = chosen.slug || null;
+      // If we enforced a house tool, advertise tools route in headers
+      headers["X-Route"] = "tools";
     } else {
       finalText = removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
     }
@@ -447,7 +560,7 @@ export const handler: Handler = async (event) => {
     }
 
     // ---- headers ----
-    headers["X-Route"] = String(out?.route ?? decision.route);
+    if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
     headers["X-RAG"] = String(!!(decision?.ragMeta?.count ?? 0));
     headers["X-RAG-Count"] = String(decision?.ragMeta?.count ?? 0);
     if (decision?.ragMeta?.mode) headers["X-RAG-Mode"] = String(decision.ragMeta.mode);
@@ -462,7 +575,7 @@ export const handler: Handler = async (event) => {
       const row = {
         ts: new Date().toISOString(),
         q: userText.slice(0, 500),
-        route: out?.route ?? decision.route,
+        route: headers["X-Route"] || out?.route || decision.route,
         rag_count: decision?.ragMeta?.count ?? 0,
         rag_mode: decision?.ragMeta?.mode ?? null,
         model: decision?.ragMeta?.model ?? null,
@@ -470,7 +583,10 @@ export const handler: Handler = async (event) => {
         duration_ms: duration,
         ok: true,
       };
-      void sb.from("events").insert(row).then(() => {}, () => {});
+      void sb.from("events").insert(row).then(
+        () => {},
+        () => {}
+      );
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
@@ -506,7 +622,10 @@ export const handler: Handler = async (event) => {
         ok: false,
         err: String(err?.stack || err?.message || err || "unknown"),
       };
-      void sb.from("events").insert(row).then(() => {}, () => {});
+      void sb.from("events").insert(row).then(
+        () => {},
+        () => {}
+      );
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
