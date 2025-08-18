@@ -14,13 +14,17 @@ import {
   removeExternalToolMentions,
 } from "./lib/sanitize";
 
-// ---- helpers (policy-safe) ----
-
-// Supabase client (optional telemetry + tool registry)
+// ---------------------------
+// Supabase (optional; telemetry & registry)
+// ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
     ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     : null;
+
+// ---------------------------
+// Helpers (policy-safe)
+// ---------------------------
 
 /** Fetch enabled tools (minimal columns) */
 async function getToolRegistry(): Promise<ToolDoc[]> {
@@ -33,7 +37,17 @@ async function getToolRegistry(): Promise<ToolDoc[]> {
   return data as unknown as ToolDoc[];
 }
 
-/** normalize for fuzzy checks (mirrors your sanitize.ts approach) */
+/** 5 min in-memory cache for tool registry */
+let TOOL_CACHE: { data: ToolDoc[]; ts: number } | null = null;
+async function getToolRegistryCached(): Promise<ToolDoc[]> {
+  const now = Date.now();
+  if (TOOL_CACHE && now - TOOL_CACHE.ts < 5 * 60_000) return TOOL_CACHE.data;
+  const data = await getToolRegistry();
+  TOOL_CACHE = { data, ts: now };
+  return data;
+}
+
+/** normalize for fuzzy checks (mirrors sanitize.ts approach) */
 function norm(s: string) {
   return String(s || "")
     .toLowerCase()
@@ -67,7 +81,7 @@ function matchToolByIntent(userText: string, tools: ToolDoc[]): ToolDoc | null {
         ? (t as any).patterns
         : String((t as any).patterns || "")
             .split(",")
-            .map(s => s.trim())
+            .map((s) => s.trim())
             .filter(Boolean);
 
     for (const rx of rawPatterns) {
@@ -112,10 +126,7 @@ function detectToolFromAssistant(assistantText: string, tools: ToolDoc[]): ToolD
   // exact or fuzzy title match (>= 0.7 overlap)
   let best: { tool: ToolDoc; score: number } | null = null;
   for (const t of tools) {
-    const s =
-      norm(t.title) === norm(candidate)
-        ? 1
-        : tokenOverlap(t.title, candidate);
+    const s = norm(t.title) === norm(candidate) ? 1 : tokenOverlap(t.title, candidate);
     if (!best || s > best.score) best = { tool: t, score: s };
   }
   if (best && best.score >= 0.7) return best.tool;
@@ -143,39 +154,38 @@ function renderPlanForTool(tool: ToolDoc): string {
   ].join("\n");
 }
 
-// ---- agents registry ----
+// ---------------------------
+// Agents registry
+// ---------------------------
 const agents = { qa: QaAgent, coach: CoachAgent, tools: ToolsAgent } as const;
 
+// ---------------------------
+// Handler
+// ---------------------------
 export const handler: Handler = async (event) => {
   const t0 = Date.now();
-let tAfterRoute = 0, tAfterAgent = 0, tAfterPolicy = 0, tAfterTelemetry = 0;
-  
+  let tAfterRoute = 0,
+    tAfterAgent = 0,
+    tAfterPolicy = 0,
+    tAfterTelemetry = 0;
+
   // debug flags
   const POLICY_VERSION = "int-tools-hard-override-v1";
   const DEBUG_STAMP = new Date().toISOString();
   const qs = event.queryStringParameters || {};
   const debug = qs.debug === "1";
-  const mode = qs.mode || ""; // mode=dry to bypass agents
+  const mode = qs.mode || ""; // mode=dry or mode=sim
 
   // base headers
   const headers: Record<string, string> = {
     "Content-Type": "text/plain; charset=utf-8",
     "Access-Control-Expose-Headers":
-      "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp",
+      "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing",
     "X-Policy-Version": POLICY_VERSION,
     "X-Debug-Stamp": DEBUG_STAMP,
   };
   headers["X-Events"] = "boot";
   headers["X-Events-Stage"] = "start";
-
-  tAfterTelemetry = Date.now();
-headers["Server-Timing"] = [
-  `route;dur=${Math.max(0, tAfterRoute - t0)}`,
-  `agent;dur=${tAfterAgent && tAfterRoute ? tAfterAgent - tAfterRoute : 0}`,
-  `policy;dur=${tAfterPolicy && tAfterAgent ? tAfterPolicy - tAfterAgent : 0}`,
-  `telemetry;dur=${Date.now() - (tAfterPolicy || t0)}`
-].join(", ");
-
 
   // allow GET only for debug/dry pings
   if (event.httpMethod !== "POST") {
@@ -183,6 +193,7 @@ headers["Server-Timing"] = [
       headers["X-Events-Stage"] = "parsed";
       headers["X-Route"] = "noop";
       headers["X-Duration-Total"] = String(Date.now() - t0);
+      headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
       return {
         statusCode: 200,
         headers,
@@ -190,6 +201,7 @@ headers["Server-Timing"] = [
       };
     }
     headers["X-Events-Stage"] = "405";
+    headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
     return { statusCode: 405, headers, body: "Method Not Allowed" };
   }
 
@@ -216,6 +228,7 @@ headers["Server-Timing"] = [
     headers["X-Events-Stage"] = "parsed";
 
     if (!userText) {
+      headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
       return { statusCode: 400, headers, body: "Bad Request: missing user text" };
     }
 
@@ -223,6 +236,7 @@ headers["Server-Timing"] = [
     if (mode === "dry") {
       headers["X-Route"] = "dry";
       headers["X-Duration-Total"] = String(Date.now() - t0);
+      headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
       return {
         statusCode: 200,
         headers,
@@ -231,82 +245,74 @@ headers["Server-Timing"] = [
     }
 
     // ---- SIM MODE: run policy/tool selection without calling agents/OpenAI ----
-if (mode === "sim") {
-  // registry + allowlist (works if Supabase is configured)
-  let tools = await getToolRegistry();
+    if (mode === "sim") {
+      let tools = await getToolRegistryCached();
 
-  // fallback for local/dev without Supabase data
-  if (!tools.length) {
-    tools = [
-      {
-        slug: "weekly-report",
-        title: "Weekly Report",
-        keywords: "weekly,report,updates",
-        patterns: "weekly\\s+report",
-        enabled: true
-      } as any
-    ];
-  }
+      // fallback for local/dev without Supabase data
+      if (!tools.length) {
+        tools = [
+          {
+            slug: "weekly-report",
+            title: "Weekly Report",
+            keywords: "weekly,report,updates",
+            patterns: "weekly\\s+report",
+            enabled: true,
+          } as any,
+        ];
+      }
 
-  const allow = buildAllowlist(tools);
+      const allow = buildAllowlist(tools);
+      const chosen = matchToolByIntent(userText, tools);
 
-  // Try to pick a tool from the user's text; else craft a body that exercises sanitizers
-  const chosen = matchToolByIntent(userText, tools);
+      let bodyText: string;
+      let route = "coach";
+      let recoSlug: string | null = null;
 
-  let bodyText: string;
-  let route = "coach";
-  let recoSlug: string | null = null;
+      if (chosen) {
+        route = "tools";
+        bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
+        recoSlug = (chosen as any).slug || null;
+      } else {
+        const rogue = [
+          "Use Asana or ClickUp for this: https://example.com",
+          "Alternatively, Microsoft Teams could work.",
+          "Try: Random External Tool",
+        ].join("\n");
+        bodyText = removeExternalToolMentions(stripAllTryLines(rogue), allow);
+      }
 
-  if (chosen) {
-    route = "tools";
-    bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
-    recoSlug = (chosen as any).slug || null;
-  } else {
-    // include external brands + a rogue Try line to verify policy stripping
-    const rogue = [
-      "Use Asana or ClickUp for this: https://example.com",
-      "Alternatively, Microsoft Teams could work.",
-      "Try: Random External Tool"
-    ].join("\n");
+      headers["X-Route"] = route;
+      headers["X-RAG"] = "false";
+      headers["X-RAG-Count"] = "0";
+      headers["X-Reco"] = String(!!recoSlug);
+      if (recoSlug) headers["X-Reco-Slug"] = recoSlug;
 
-    // sanitize like the real non-tools path
-    bodyText = removeExternalToolMentions(stripAllTryLines(rogue), allow);
-  }
+      // fire-and-forget telemetry
+      if (sb) {
+        sb
+          .from("events")
+          .insert({
+            ts: new Date().toISOString(),
+            q: userText.slice(0, 500),
+            route,
+            rag_count: 0,
+            rag_mode: null,
+            model: null,
+            reco_slug: recoSlug,
+            duration_ms: Date.now() - t0,
+            ok: true,
+          })
+          .then(() => {});
+        headers["X-Events"] = "queued";
+      } else {
+        headers["X-Events"] = "no-sb";
+      }
 
-  // headers like normal
-  headers["X-Route"] = route;
-  headers["X-RAG"] = "false";
-  headers["X-RAG-Count"] = "0";
-  headers["X-Reco"] = String(!!recoSlug);
-  if (recoSlug) headers["X-Reco-Slug"] = recoSlug;
-  headers["X-Duration-Total"] = String(Date.now() - t0);
-  headers["X-Events-Stage"] = "success";
-
-  // telemetry (optional)
-  try {
-    if (!sb) {
-      headers["X-Events"] = "no-sb";
-    } else {
-      const { error } = await sb.from("events").insert({
-        ts: new Date().toISOString(),
-        q: userText.slice(0, 500),
-        route,
-        rag_count: 0,
-        rag_mode: null,
-        model: null,
-        reco_slug: recoSlug,
-        duration_ms: Date.now() - t0,
-        ok: true
-      });
-      headers["X-Events"] = error ? "err" : "ok";
-      if (error) headers["X-Events-Err"] = String((error as any).code || "insert_error");
+      headers["X-Events-Stage"] = "success";
+      headers["X-Duration-Total"] = String(Date.now() - t0);
+      headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
+      return { statusCode: 200, headers, body: bodyText.trim() };
     }
-  } catch {
-    headers["X-Events"] = "threw";
-  }
-
-  return { statusCode: 200, headers, body: bodyText.trim() };
-}
 
     // ---- route & run ----
     const decision = await pickRoute(userText, clientMessages as any);
@@ -321,11 +327,9 @@ if (mode === "sim") {
     }
     tAfterAgent = Date.now();
 
-
     // ---- tool enforcement (hard override, internal only) ----
-    const tools = await getToolRegistry();
+    const tools = await getToolRegistryCached();
     const allow = buildAllowlist(tools || []);
-    // 1) try to pick by user intent; 2) fallback to assistant "Try:" if it matches a house tool
     const chosen =
       matchToolByIntent(userText, tools) ||
       detectToolFromAssistant(out?.text ?? "", tools);
@@ -339,9 +343,9 @@ if (mode === "sim") {
       recoSlug = (chosen as any).slug || null;
     } else {
       // Non-tools path (or no valid internal match): strip Try lines and external mentions, keep neutral guidance
-      const scrubbed = removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
-      finalText = scrubbed;
+      finalText = removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
     }
+    tAfterPolicy = Date.now();
 
     out = {
       ...(out || { text: "", route: decision.route }),
@@ -355,8 +359,6 @@ if (mode === "sim") {
       },
       reco: !!recoSlug,
     };
-    tAfterPolicy = Date.now();
-
 
     // ---- headers ----
     headers["X-Route"] = String(out?.route ?? decision.route);
@@ -367,14 +369,14 @@ if (mode === "sim") {
     headers["X-Reco"] = String(!!out?.reco);
     if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
 
-    // ---- telemetry ----
+    // ---- telemetry (fire-and-forget) ----
     const duration = Date.now() - t0;
     headers["X-Duration-Total"] = String(duration);
-    try {
-      if (!sb) {
-        headers["X-Events"] = "no-sb";
-      } else {
-        const { error } = await sb.from("events").insert({
+    if (sb) {
+      sb
+        .from("events")
+        .insert({
+          ts: new Date().toISOString(),
           q: userText.slice(0, 500),
           route: out?.route ?? decision.route,
           rag_count: decision?.ragMeta?.count ?? 0,
@@ -383,31 +385,35 @@ if (mode === "sim") {
           reco_slug: out?.meta?.recoSlug ?? null,
           duration_ms: duration,
           ok: true,
-        });
-        if (error) {
-          headers["X-Events"] = "err";
-          headers["X-Events-Err"] = String((error as any).code ?? "insert_error");
-          headers["X-Events-Msg"] = String((error as any).message ?? "").slice(0, 120);
-        } else {
-          headers["X-Events"] = "ok";
-        }
-      }
-    } catch (e: any) {
-      headers["X-Events"] = "threw";
-      headers["X-Events-Err"] = String(e?.name ?? "throw");
-      headers["X-Events-Msg"] = String(e?.message ?? "").slice(0, 120);
+        })
+        .then(() => {});
+      headers["X-Events"] = "queued";
+    } else {
+      headers["X-Events"] = "no-sb";
     }
-
     headers["X-Events-Stage"] = "success";
+
+    // ---- server-timing ----
+    tAfterTelemetry = Date.now();
+    headers["Server-Timing"] = [
+      `route;dur=${tAfterRoute - t0}`,
+      `agent;dur=${tAfterAgent - tAfterRoute}`,
+      `policy;dur=${tAfterPolicy - tAfterAgent}`,
+      `telemetry;dur=${tAfterTelemetry - tAfterPolicy}`,
+      `total;dur=${Date.now() - t0}`,
+    ].join(", ");
+
     return { statusCode: 200, headers, body: out?.text || "" };
   } catch (err: any) {
     const duration = Date.now() - t0;
     headers["X-Duration-Total"] = String(duration);
 
-    // log failure
-    try {
-      if (sb) {
-        await sb.from("events").insert({
+    // fire-and-forget failure telemetry
+    if (sb) {
+      sb
+        .from("events")
+        .insert({
+          ts: new Date().toISOString(),
           q: userText.slice(0, 500),
           route: out?.route ?? null,
           rag_count: out?.meta?.rag ?? 0,
@@ -417,18 +423,21 @@ if (mode === "sim") {
           duration_ms: duration,
           ok: false,
           err: String(err?.stack || err?.message || err || "unknown"),
-        });
-        headers["X-Events"] = "ok";
-      } else {
-        headers["X-Events"] = "no-sb";
-      }
-    } catch (e: any) {
-      headers["X-Events"] = "threw";
-      headers["X-Events-Err"] = String(e?.name ?? "throw");
-      headers["X-Events-Msg"] = String(e?.message ?? "").slice(0, 120);
+        })
+        .then(() => {});
+      headers["X-Events"] = "queued";
+    } else {
+      headers["X-Events"] = "no-sb";
     }
 
     headers["X-Events-Stage"] = "error";
+    headers["Server-Timing"] = [
+      `route;dur=${Math.max(0, tAfterRoute - t0)}`,
+      `agent;dur=${tAfterAgent && tAfterRoute ? tAfterAgent - tAfterRoute : 0}`,
+      `policy;dur=${tAfterPolicy && tAfterAgent ? tAfterPolicy - tAfterAgent : 0}`,
+      `telemetry;dur=${Date.now() - (tAfterPolicy || t0)}`,
+      `total;dur=${Date.now() - t0}`,
+    ].join(", ");
 
     if (debug) {
       headers["Content-Type"] = "application/json; charset=utf-8";
