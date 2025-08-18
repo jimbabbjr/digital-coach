@@ -5,18 +5,14 @@ import { createClient } from "@supabase/supabase-js";
 import { route as pickRoute } from "./lib/agents/router";
 import { QaAgent } from "./lib/agents/qa";
 import { CoachAgent } from "./lib/agents/coach";
-import { ToolsAgent } from "./lib/agents/tools"; // kept, but we route to Coach for tools turns (see note)
+// We keep ToolsAgent imported if you want to switch to direct plan on tools route later
+import { ToolsAgent } from "./lib/agents/tools";
 
-import {
-  buildAllowlist,
-  stripAllTryLines,
-  removeExternalToolMentions,
-} from "./lib/sanitize";
-
+import { buildAllowlist, stripAllTryLines, removeExternalToolMentions } from "./lib/sanitize";
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 
 // ---------------------------
-// Supabase (optional; telemetry & session memory & registry)
+// Supabase (optional; telemetry & registry)
 // ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -24,28 +20,22 @@ const sb =
     : null;
 
 // ---------------------------
-// Types & helpers
+// Types & helpers (policy-safe)
 // ---------------------------
-
-/** Canonical Try line */
-function formatTryLine(t: { title: string }) {
-  return `Try: ${t.title}`;
-}
-
-// ---- Plan params & renderer (supports refinements) ----
-export type PlanParams = {
+type PlanParams = {
   cadence?: "weekly" | "biweekly" | "monthly" | "daily";
   due_day?: string; // e.g., "Friday"
   due_time?: string; // e.g., "3pm"
   channel?: "slack" | "email" | "app";
   anonymous?: boolean;
-  reminders?: 0 | 1 | 2; // number of nudges
+  reminders?: 0 | 1 | 2;
 };
 
-function renderPlanForTool(
-  tool: { title: string; outcome?: string | null },
-  p: PlanParams = {}
-): string {
+function formatTryLine(t: { title: string }) {
+  return `Try: ${t.title}`;
+}
+
+function renderPlanForTool(tool: { title: string; outcome?: string | null }, p: PlanParams = {}) {
   const outcome = tool.outcome || "reliable weekly signal without manual chasing";
   const cadence = p.cadence || "weekly";
   const day = p.due_day || (cadence === "weekly" ? "Friday" : undefined);
@@ -55,25 +45,25 @@ function renderPlanForTool(
   const anon = p.anonymous ? " (anonymous collection enabled)" : "";
 
   return [
-  `Here’s the fastest path using **${tool.title}**:`,
-  "",
-  `- **Set the rhythm:** ${
-    cadence === "weekly"
-      ? "Every week"
-      : cadence === "biweekly"
-      ? "Every other week"
-      : cadence.charAt(0).toUpperCase() + cadence.slice(1)
-  }${day ? ` on ${day}` : ""} at ${time}.`,
-  "- **Use the built-in template:** Wins, blockers, next week.",
-  `- **Nudges:** ${rem} reminder${rem === 1 ? "" : "s"} before the deadline via ${channel}.`,
-  `- **Model the habit:** Post your own update first${anon}.`,
-  "- **Close the loop:** Share highlights to show value.",
-  "",
-  `Result: ${outcome}.`,
-].join("\n");
+    `Here’s the fastest path using **${tool.title}**:`,
+    "",
+    `- **Set the rhythm:** ${
+      cadence === "weekly"
+        ? "Every week"
+        : cadence === "biweekly"
+        ? "Every other week"
+        : cadence.charAt(0).toUpperCase() + cadence.slice(1)
+    }${day ? ` on ${day}` : ""} at ${time}.`,
+    "- **Use the built-in template:** Wins, blockers, next week.",
+    `- **Nudges:** ${rem} reminder${rem === 1 ? "" : "s"} before the deadline via ${channel}.`,
+    `- **Model the habit:** Post your own update first${anon}.`,
+    "- **Close the loop:** Share highlights to show value.",
+    "",
+    `Result: ${outcome}.`,
+  ].join("\n");
 }
 
-// ---- light normalization helpers ----
+// text utils
 function norm(s: string) {
   return String(s || "")
     .toLowerCase()
@@ -117,8 +107,8 @@ function isEnabledRow(row: any): boolean {
   return true;
 }
 
-// ---- Tool row normalization (schema-agnostic) ----
-export type ToolRow = {
+// Flexible tool row
+type ToolRow = {
   slug: string;
   title: string;
   summary?: string | null;
@@ -132,6 +122,7 @@ export type ToolRow = {
 
 function normalizeToolRow(row: any): ToolRow | null {
   if (!row) return null;
+
   const title = (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) || "";
   const slug = (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) || "";
   if (!title || !slug) return null;
@@ -168,6 +159,7 @@ async function getToolRegistry(): Promise<ToolRow[]> {
   return out;
 }
 
+// 5 min cache
 let TOOL_CACHE: { data: ToolRow[]; ts: number } | null = null;
 async function getToolRegistryCached(): Promise<ToolRow[]> {
   const now = Date.now();
@@ -177,13 +169,14 @@ async function getToolRegistryCached(): Promise<ToolRow[]> {
   return data;
 }
 
-// ---- Smart intent match (patterns + keywords + lexical overlap) ----
+// Smart intent match (schema-agnostic)
 function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
   const text = String(userText || "");
   const lower = text.toLowerCase();
   const hasWeeklyReport = /\bweekly\b.*\b(report|updates?)\b/i.test(text);
 
   let best: { tool: ToolRow; score: number } | null = null;
+
   for (const t of tools) {
     const title = t.title?.trim();
     if (!title) continue;
@@ -219,6 +212,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
 
     if (!best || score > best.score) best = { tool: t, score };
   }
+
   if (!best || best.score < 1.0) return null;
   return best.tool;
 }
@@ -238,7 +232,35 @@ function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolR
   return null;
 }
 
-// ---- Follow-up classification & params parsing ----
+// ---- session memory helpers ----
+async function getSessionMem(sessionId: string) {
+  if (!sb || !sessionId) return { last_reco_slug: null as string | null, slots: {} as any };
+  const { data } = await sb
+    .from("session_memory")
+    .select("last_reco_slug, slots")
+    .eq("session_id", sessionId)
+    .maybeSingle();
+  return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
+}
+
+async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | null; slots?: any }) {
+  if (!sb || !sessionId) return;
+  void sb
+    .from("session_memory")
+    .upsert({
+      session_id: sessionId,
+      last_reco_slug: mem.last_reco_slug,
+      slots: mem.slots ?? {},
+      updated_at: new Date().toISOString(),
+    })
+    .then(
+      () => {},
+      () => {}
+    );
+}
+
+// ---- follow-up classifier ----
+type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
 function isAffirmativeFollowUp(text: string): boolean {
   return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(text);
 }
@@ -267,7 +289,7 @@ function parseRefineParams(text: string): PlanParams | null {
 
   if (/\bslack\b/.test(t)) p.channel = "slack";
   else if (/\bemail\b/.test(t)) p.channel = "email";
-  else if (/(^|\b)(app|in[-\s]?app)\b/.test(t)) p.channel = "app";
+  else if (/\b(app|in[-\s]?app)\b/.test(t)) p.channel = "app";
 
   if (/\banonym(ous|ously)?\b/.test(t)) p.anonymous = true;
 
@@ -277,8 +299,6 @@ function parseRefineParams(text: string): PlanParams | null {
 
   return Object.keys(p).length ? p : null;
 }
-
-type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
 function classifyFollowUp(text: string): FollowKind {
   if (isAffirmativeFollowUp(text)) return "accept";
   if (isNegativeFollowUp(text)) return "reject";
@@ -289,33 +309,6 @@ function classifyFollowUp(text: string): FollowKind {
 }
 function mergeParams(a: PlanParams = {}, b: PlanParams = {}): PlanParams {
   return { ...a, ...b };
-}
-
-// ---- session memory helpers ----
-async function getSessionMem(sessionId: string) {
-  if (!sb || !sessionId) return { last_reco_slug: null as string | null, slots: {} as any };
-  const { data } = await sb
-    .from("session_memory")
-    .select("last_reco_slug, slots")
-    .eq("session_id", sessionId)
-    .maybeSingle();
-  return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
-}
-
-async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | null; slots?: any }) {
-  if (!sb || !sessionId) return;
-  void sb
-    .from("session_memory")
-    .upsert({
-      session_id: sessionId,
-      last_reco_slug: mem.last_reco_slug,
-      slots: mem.slots ?? {},
-      updated_at: new Date().toISOString(),
-    })
-    .then(
-      () => {},
-      () => {}
-    );
 }
 
 // ---------------------------
@@ -349,7 +342,6 @@ export const handler: Handler = async (event) => {
   headers["X-Events"] = "boot";
   headers["X-Events-Stage"] = "start";
 
-  // allow GET only for debug/dry pings
   if (event.httpMethod !== "POST") {
     if (debug || mode === "dry") {
       headers["X-Events-Stage"] = "parsed";
@@ -387,7 +379,11 @@ export const handler: Handler = async (event) => {
         ?.content ??
       "";
     userText = String(userText).trim();
-    const sessionId: string = body.sessionId || (event.headers["x-session-id"] as string) || "anon";
+    const sessionId: string =
+      body.sessionId ||
+      (event.headers["x-session-id"] as string) ||
+      (event.headers["X-Session-Id"] as string) ||
+      "anon";
     headers["X-Events-Stage"] = "parsed";
 
     if (!userText) {
@@ -395,30 +391,24 @@ export const handler: Handler = async (event) => {
       return { statusCode: 400, headers, body: "Bad Request: missing user text" };
     }
 
-    // load session memory
     const mem = await getSessionMem(sessionId);
 
-    // ---- DRY MODE: bypass agents to isolate infra/env ----
+    // ---- DRY MODE ----
     if (mode === "dry") {
       headers["X-Route"] = "dry";
       headers["X-Duration-Total"] = String(Date.now() - t0);
       headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
-      return {
-        statusCode: 200,
-        headers,
-        body: `DRY OK — received: "${userText}"`,
-      };
+      return { statusCode: 200, headers, body: `DRY OK — received: "${userText}"` };
     }
 
-    // ---- SIM MODE: policy/tool selection without OpenAI ----
+    // ---- SIM MODE (no OpenAI; policy only) ----
     if (mode === "sim") {
       let tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
-
       const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
       const chosen = matchToolByIntent(userText, tools);
 
-      let bodyText: string;
+      let bodyText = "";
       let route = "coach";
       let recoSlug: string | null = null;
 
@@ -458,9 +448,7 @@ export const handler: Handler = async (event) => {
           })
           .then(() => {}, () => {});
         headers["X-Events"] = "queued";
-      } else {
-        headers["X-Events"] = "no-sb";
-      }
+      } else headers["X-Events"] = "no-sb";
 
       headers["X-Events-Stage"] = "success";
       headers["X-Duration-Total"] = String(Date.now() - t0);
@@ -468,19 +456,36 @@ export const handler: Handler = async (event) => {
       return { statusCode: 200, headers, body: bodyText.trim() };
     }
 
-    // ---- Deterministic follow-up (accept / reject / refine / askinfo / compare) ----
+    // ---- Deterministic follow-up layer (accept / reject / refine / ask-info / compare) ----
     const follow = classifyFollowUp(userText);
-    const proposed = (mem.slots && (mem.slots as any).proposed) || (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
+
+    // 1) proposed from session mem
+    let proposed =
+      (mem.slots && (mem.slots as any).proposed) ||
+      (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
+
+    // 2) fallback proposed from last assistant Try: line (no DB required)
+    if (!proposed) {
+      const lastAssistantText =
+        [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")?.content || "";
+      if (lastAssistantText) {
+        const toolsForDetect = await getToolRegistryCached();
+        const det = detectToolFromAssistant(lastAssistantText, toolsForDetect);
+        if (det) proposed = { slug: det.slug, title: det.title, params: {} };
+      }
+    }
 
     if (proposed) {
       const tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
       const chosen =
-        tools.find((t) => t.slug === proposed.slug) || tools.find((t) => t.title === proposed.title) || null;
+        tools.find((t) => t.slug === (proposed as any).slug) ||
+        tools.find((t) => t.title === (proposed as any).title) ||
+        null;
 
       if (follow === "accept" && chosen) {
         const params = ((proposed as any).params as PlanParams) || {};
-        const finalText = `${renderPlanForTool(chosen, params)}\n\nTry: ${chosen.title}`;
+        const finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`;
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
         headers["X-Reco-Slug"] = String(chosen.slug || "");
@@ -490,6 +495,9 @@ export const handler: Handler = async (event) => {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
         });
+        headers["X-Events-Stage"] = "success";
+        headers["X-Duration-Total"] = String(Date.now() - t0);
+        headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
         return { statusCode: 200, headers, body: finalText };
       }
 
@@ -501,7 +509,7 @@ export const handler: Handler = async (event) => {
       if (follow === "refine" && chosen) {
         const delta = parseRefineParams(userText) || {};
         const merged = mergeParams(((proposed as any).params as PlanParams) || {}, delta);
-        const finalText = `${renderPlanForTool(chosen, merged)}\n\nTry: ${chosen.title}`;
+        const finalText = `${renderPlanForTool(chosen, merged)}\n\n${formatTryLine(chosen)}`;
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
         headers["X-Reco-Slug"] = String(chosen.slug || "");
@@ -511,6 +519,9 @@ export const handler: Handler = async (event) => {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: merged } },
         });
+        headers["X-Events-Stage"] = "success";
+        headers["X-Duration-Total"] = String(Date.now() - t0);
+        headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
         return { statusCode: 200, headers, body: finalText };
       }
 
@@ -523,22 +534,25 @@ export const handler: Handler = async (event) => {
           "",
           `If you want to proceed, say "yes" or refine (e.g., "biweekly via Slack on Fridays at 2pm").`,
         ].join("\n");
-        headers["X-Route"] = "coach"; // informational only
+        headers["X-Route"] = "coach";
         headers["X-Reco"] = "false";
         await setSessionMem(sessionId, {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: ((proposed as any).params as PlanParams) || {} } },
         });
+        headers["X-Events-Stage"] = "success";
+        headers["X-Duration-Total"] = String(Date.now() - t0);
+        headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
         return { statusCode: 200, headers, body: blurb };
       }
 
       if (follow === "compare") {
         await setSessionMem(sessionId, { last_reco_slug: null, slots: {} });
-        // fall through to router
+        // fall through to router (likely coach)
       }
     }
 
-    // ---- Router per turn (LLM-assisted w/ confidence) ----
+    // ---- Route & run (Router v2 with confidence, fallback to Router v1) ----
     let decision: any = null;
     try {
       const tools = await getToolRegistryCached();
@@ -554,7 +568,7 @@ export const handler: Handler = async (event) => {
         messages: clientMessages as any,
         userText,
         candidates,
-        lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
+        lastRecoSlug: mem.last_reco_slug,
       });
       if (scored && typeof scored.tool_intent_score === "number" && scored.tool_intent_score < 0.65) {
         // ignore low-confidence tool picks; Coach will handle and policy may enforce
@@ -570,18 +584,16 @@ export const handler: Handler = async (event) => {
     if (!decision) decision = await pickRoute(userText, clientMessages as any);
     tAfterRoute = Date.now();
 
-    // ---- Execute chosen path
     if (decision.route === "qa") {
       out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
     } else {
-      // NOTE: even when router leans "tools", we let Coach craft the guidance, then enforce house policy below.
+      // Even when router leans "tools", we let Coach craft the guidance;
+      // the policy layer below enforces the internal tool plan and sets X-Route=tools if applied.
       out = await CoachAgent.handle({ userText, messages: clientMessages });
-      // If you prefer to skip Coach when route=="tools", call ToolsAgent instead:
-      // if (decision.route === "tools") out = await ToolsAgent.handle({ userText, messages: clientMessages });
     }
     tAfterAgent = Date.now();
 
-    // ---- Policy: enforce internal tool if matched; else strip externals
+    // ---- Policy: enforce internal tool if matched ----
     const tools = await getToolRegistryCached();
     headers["X-Tools-Len"] = String(tools.length);
     const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
@@ -595,11 +607,14 @@ export const handler: Handler = async (event) => {
     let recoSlug: string | null = null;
 
     if (chosen) {
-      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
+      const params: PlanParams = {};
       finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
       recoSlug = chosen.slug || null;
-      headers["X-Route"] = "tools"; // reflect enforced plan in telemetry
-      await setSessionMem(sessionId, { last_reco_slug: chosen.slug || null, slots: { proposed: { slug: chosen.slug, title: chosen.title, params } } });
+      headers["X-Route"] = "tools"; // reflect enforcement in headers
+      await setSessionMem(sessionId, {
+        last_reco_slug: chosen.slug || null,
+        slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+      });
     } else {
       finalText = removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
     }
