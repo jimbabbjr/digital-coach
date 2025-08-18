@@ -7,6 +7,17 @@
   node_bundler = "esbuild"
   external_node_modules = ["openai"]
 
+  [functions]
+  node_bundler = "esbuild"
+  directory = "netlify/functions"
+
+[functions."chat_v2"]
+  regions = ["us-east-1"]   # pick the closest region to you/customers
+
+[[scheduled]]
+  path = "/.netlify/functions/warm"
+  schedule = "*/5 * * * *"
+
 # Make /api/* hit your functions
 [[redirects]]
   from = "/api/chat"
@@ -45,14 +56,3 @@
 
 [build.environment]
   NODE_VERSION = "20"
-
-[functions]
-  node_bundler = "esbuild"
-  directory = "netlify/functions"
-
-[functions."chat_v2"]
-  regions = ["us-east-1"]   # pick the closest region to you/customers
-
-[[scheduled]]
-  path = "/.netlify/functions/warm"
-  schedule = "*/5 * * * *"
