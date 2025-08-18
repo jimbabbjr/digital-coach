@@ -55,22 +55,22 @@ function renderPlanForTool(
   const anon = p.anonymous ? " (anonymous collection enabled)" : "";
 
   return [
-    `Here’s the fastest path using **${tool.title}**:`,
-    "",
-    `- **Set the rhythm:** ${
-      cadence === "weekly"
-        ? "Every week"
-        : cadence === "biweekly"
-        ? "Every other week"
-        : cadence.charAt(0).toUpperCase() + cadence.slice(1)
-    }${day ? ` on ${day}` : ""} at ${time}.`,
-    "- **Use the built-in template:** Wins, blockers, next week.",
-    `- **Nudges:** ${rem} reminder${rem === 1 ? "" : "s"} before the deadline via ${channel}.\`,
-    `- **Model the habit:** Post your own update first${anon}.\`,
-    "- **Close the loop:** Share highlights to show value.",
-    "",
-    `Result: ${outcome}.`,
-  ].join("\n");
+  `Here’s the fastest path using **${tool.title}**:`,
+  "",
+  `- **Set the rhythm:** ${
+    cadence === "weekly"
+      ? "Every week"
+      : cadence === "biweekly"
+      ? "Every other week"
+      : cadence.charAt(0).toUpperCase() + cadence.slice(1)
+  }${day ? ` on ${day}` : ""} at ${time}.`,
+  "- **Use the built-in template:** Wins, blockers, next week.",
+  `- **Nudges:** ${rem} reminder${rem === 1 ? "" : "s"} before the deadline via ${channel}.`,
+  `- **Model the habit:** Post your own update first${anon}.`,
+  "- **Close the loop:** Share highlights to show value.",
+  "",
+  `Result: ${outcome}.`,
+].join("\n");
 }
 
 // ---- light normalization helpers ----
