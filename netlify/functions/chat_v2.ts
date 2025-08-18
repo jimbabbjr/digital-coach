@@ -148,7 +148,8 @@ const agents = { qa: QaAgent, coach: CoachAgent, tools: ToolsAgent } as const;
 
 export const handler: Handler = async (event) => {
   const t0 = Date.now();
-
+let tAfterRoute = 0, tAfterAgent = 0, tAfterPolicy = 0, tAfterTelemetry = 0;
+  
   // debug flags
   const POLICY_VERSION = "int-tools-hard-override-v1";
   const DEBUG_STAMP = new Date().toISOString();
@@ -166,6 +167,15 @@ export const handler: Handler = async (event) => {
   };
   headers["X-Events"] = "boot";
   headers["X-Events-Stage"] = "start";
+
+  tAfterTelemetry = Date.now();
+headers["Server-Timing"] = [
+  `route;dur=${Math.max(0, tAfterRoute - t0)}`,
+  `agent;dur=${tAfterAgent && tAfterRoute ? tAfterAgent - tAfterRoute : 0}`,
+  `policy;dur=${tAfterPolicy && tAfterAgent ? tAfterPolicy - tAfterAgent : 0}`,
+  `telemetry;dur=${Date.now() - (tAfterPolicy || t0)}`
+].join(", ");
+
 
   // allow GET only for debug/dry pings
   if (event.httpMethod !== "POST") {
@@ -300,6 +310,7 @@ if (mode === "sim") {
 
     // ---- route & run ----
     const decision = await pickRoute(userText, clientMessages as any);
+    tAfterRoute = Date.now();
 
     if (decision.route === "qa") {
       out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
@@ -308,6 +319,8 @@ if (mode === "sim") {
     } else {
       out = await CoachAgent.handle({ userText, messages: clientMessages });
     }
+    tAfterAgent = Date.now();
+
 
     // ---- tool enforcement (hard override, internal only) ----
     const tools = await getToolRegistry();
@@ -342,6 +355,8 @@ if (mode === "sim") {
       },
       reco: !!recoSlug,
     };
+    tAfterPolicy = Date.now();
+
 
     // ---- headers ----
     headers["X-Route"] = String(out?.route ?? decision.route);
