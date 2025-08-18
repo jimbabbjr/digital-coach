@@ -281,8 +281,16 @@ function isNegativeFollowUp(text: string): boolean {
   return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(text);
 }
 function isInfoFollowUp(text: string): boolean {
-  return /\b(what (is|does) it|how (does|would) (it|this) work|explain|more detail|tell me more|why)\b/i.test(text);
+  // Covers:
+  // - "what is it", "what does it do"
+  // - "what does this tool do", "how does this tool work"
+  // - "what does this do", "how does this work"
+  // - "explain", "more detail", "tell me more", "why"
+  return /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(text)
+      || /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(text)
+      || /\b(explain|more\s+detail|tell\s+me\s+more|why)\b/i.test(text);
 }
+
 function isCompareFollowUp(text: string): boolean {
   return /\b(other (options|ways)|alternatives?|compare|vs\.?|versus)\b/i.test(text);
 }
