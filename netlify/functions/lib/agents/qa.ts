@@ -22,7 +22,7 @@ export const QaAgent = {
   }: {
     userText: string;
     messages?: Array<{ role: "user" | "assistant" | "system"; content: string }>;
-    ragSpans?: Array<{ text: string; url?: string }>;
+    ragSpans?: Array<{ text: string; url?: string | null }>;
   }) {
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
