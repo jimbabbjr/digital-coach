@@ -5,14 +5,14 @@ import { createClient } from "@supabase/supabase-js";
 import { route as pickRoute } from "./lib/agents/router";
 import { QaAgent } from "./lib/agents/qa";
 import { CoachAgent } from "./lib/agents/coach";
-// We keep ToolsAgent imported if you want to switch to direct plan on tools route later
-import { ToolsAgent } from "./lib/agents/tools";
+// If you ever want to short-circuit tools turns, you can import ToolsAgent and swap it in.
+// import { ToolsAgent } from "./lib/agents/tools";
 
 import { buildAllowlist, stripAllTryLines, removeExternalToolMentions } from "./lib/sanitize";
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 
 // ---------------------------
-// Supabase (optional; telemetry & registry)
+// Supabase (optional; telemetry & registry & session memory)
 // ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -20,12 +20,12 @@ const sb =
     : null;
 
 // ---------------------------
-// Types & helpers (policy-safe)
+// Types & helpers
 // ---------------------------
 type PlanParams = {
   cadence?: "weekly" | "biweekly" | "monthly" | "daily";
-  due_day?: string; // e.g., "Friday"
-  due_time?: string; // e.g., "3pm"
+  due_day?: string;   // e.g., "Friday"
+  due_time?: string;  // e.g., "3pm"
   channel?: "slack" | "email" | "app";
   anonymous?: boolean;
   reminders?: 0 | 1 | 2;
@@ -63,7 +63,7 @@ function renderPlanForTool(tool: { title: string; outcome?: string | null }, p: 
   ].join("\n");
 }
 
-// text utils
+// --- text utils ---
 function norm(s: string) {
   return String(s || "")
     .toLowerCase()
@@ -107,7 +107,23 @@ function isEnabledRow(row: any): boolean {
   return true;
 }
 
-// Flexible tool row
+// --- cookie helpers ---
+function getCookie(name: string, cookieHeader?: string): string | null {
+  const ck = cookieHeader || "";
+  const re = new RegExp(`(?:^|;\\s*)${name}=([^;]*)`);
+  const m = ck.match(re);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+function setCookie(
+  headers: Record<string, string>,
+  name: string,
+  value: string,
+  attrs = "; Path=/; SameSite=Lax" // omit Secure/HttpOnly so it works on localhost + visible for demo
+) {
+  headers["Set-Cookie"] = `${name}=${encodeURIComponent(value || "")}${attrs}`;
+}
+
+// --- flexible tool row ---
 type ToolRow = {
   slug: string;
   title: string;
@@ -159,7 +175,7 @@ async function getToolRegistry(): Promise<ToolRow[]> {
   return out;
 }
 
-// 5 min cache
+// 5-min in-memory cache
 let TOOL_CACHE: { data: ToolRow[]; ts: number } | null = null;
 async function getToolRegistryCached(): Promise<ToolRow[]> {
   const now = Date.now();
@@ -169,14 +185,13 @@ async function getToolRegistryCached(): Promise<ToolRow[]> {
   return data;
 }
 
-// Smart intent match (schema-agnostic)
+// --- match intent to tool (regex + keyword hits + lexical overlap) ---
 function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
   const text = String(userText || "");
   const lower = text.toLowerCase();
   const hasWeeklyReport = /\bweekly\b.*\b(report|updates?)\b/i.test(text);
 
   let best: { tool: ToolRow; score: number } | null = null;
-
   for (const t of tools) {
     const title = t.title?.trim();
     if (!title) continue;
@@ -189,6 +204,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     const haystack = [title, summary, why, outcome, content].map(norm).join(" ");
     const user = norm(text);
 
+    // patterns
     const rawPatterns = Array.isArray(t.patterns) ? t.patterns : toList(t.patterns);
     let patternHits = 0;
     for (const rx of rawPatterns) {
@@ -197,10 +213,12 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
       } catch {}
     }
 
+    // keywords
     const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) => s.toLowerCase());
     let kwHits = 0;
     for (const k of kws) if (k && lower.includes(k)) kwHits++;
 
+    // lexical overlap
     const A = new Set(user.split(" ").filter(Boolean));
     const B = new Set(haystack.split(" ").filter(Boolean));
     let overlap = 0;
@@ -212,7 +230,6 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
 
     if (!best || score > best.score) best = { tool: t, score };
   }
-
   if (!best || best.score < 1.0) return null;
   return best.tool;
 }
@@ -232,7 +249,7 @@ function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolR
   return null;
 }
 
-// ---- session memory helpers ----
+// --- session memory helpers (optional; SERVICE_ROLE only) ---
 async function getSessionMem(sessionId: string) {
   if (!sb || !sessionId) return { last_reco_slug: null as string | null, slots: {} as any };
   const { data } = await sb
@@ -242,7 +259,6 @@ async function getSessionMem(sessionId: string) {
     .maybeSingle();
   return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
 }
-
 async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | null; slots?: any }) {
   if (!sb || !sessionId) return;
   void sb
@@ -253,13 +269,10 @@ async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | 
       slots: mem.slots ?? {},
       updated_at: new Date().toISOString(),
     })
-    .then(
-      () => {},
-      () => {}
-    );
+    .then(() => {}, () => {});
 }
 
-// ---- follow-up classifier ----
+// --- follow-up classifier & params ---
 type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
 function isAffirmativeFollowUp(text: string): boolean {
   return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(text);
@@ -312,11 +325,6 @@ function mergeParams(a: PlanParams = {}, b: PlanParams = {}): PlanParams {
 }
 
 // ---------------------------
-// Agents registry
-// ---------------------------
-const agents = { qa: QaAgent, coach: CoachAgent, tools: ToolsAgent } as const;
-
-// ---------------------------
 // Handler
 // ---------------------------
 export const handler: Handler = async (event) => {
@@ -342,6 +350,7 @@ export const handler: Handler = async (event) => {
   headers["X-Events"] = "boot";
   headers["X-Events-Stage"] = "start";
 
+  // allow GET only for debug/dry pings
   if (event.httpMethod !== "POST") {
     if (debug || mode === "dry") {
       headers["X-Events-Stage"] = "parsed";
@@ -363,7 +372,7 @@ export const handler: Handler = async (event) => {
   let out:
     | {
         text: string;
-        route: keyof typeof agents | string;
+        route: "qa" | "coach" | "tools" | string;
         reco?: boolean;
         meta?: { rag?: number; ragMode?: string | null; model?: string | null; recoSlug?: string | null };
       }
@@ -403,7 +412,7 @@ export const handler: Handler = async (event) => {
 
     // ---- SIM MODE (no OpenAI; policy only) ----
     if (mode === "sim") {
-      let tools = await getToolRegistryCached();
+      const tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
       const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
       const chosen = matchToolByIntent(userText, tools);
@@ -416,7 +425,11 @@ export const handler: Handler = async (event) => {
         route = "tools";
         bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
         recoSlug = chosen.slug || null;
-        await setSessionMem(sessionId, { last_reco_slug: recoSlug, slots: { proposed: { slug: chosen.slug, title: chosen.title, params: {} } } });
+        setCookie(headers, "last_reco_slug", recoSlug || "");
+        await setSessionMem(sessionId, {
+          last_reco_slug: recoSlug,
+          slots: { proposed: { slug: chosen.slug, title: chosen.title, params: {} } },
+        });
       } else {
         const rogue = [
           "Use Asana or ClickUp for this: https://example.com",
@@ -456,15 +469,15 @@ export const handler: Handler = async (event) => {
       return { statusCode: 200, headers, body: bodyText.trim() };
     }
 
-    // ---- Deterministic follow-up layer (accept / reject / refine / ask-info / compare) ----
+    // ---- Deterministic follow-up layer ----
     const follow = classifyFollowUp(userText);
 
-    // 1) proposed from session mem
+    // 1) from session memory
     let proposed =
       (mem.slots && (mem.slots as any).proposed) ||
       (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
 
-    // 2) fallback proposed from last assistant Try: line (no DB required)
+    // 2) from last assistant Try: line (requires messages[])
     if (!proposed) {
       const lastAssistantText =
         [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")?.content || "";
@@ -473,6 +486,13 @@ export const handler: Handler = async (event) => {
         const det = detectToolFromAssistant(lastAssistantText, toolsForDetect);
         if (det) proposed = { slug: det.slug, title: det.title, params: {} };
       }
+    }
+
+    // 3) from cookie
+    if (!proposed) {
+      const ck = (event.headers["cookie"] as string) || (event.headers["Cookie"] as string) || "";
+      const slugFromCookie = getCookie("last_reco_slug", ck);
+      if (slugFromCookie) proposed = { slug: slugFromCookie };
     }
 
     if (proposed) {
@@ -491,6 +511,7 @@ export const handler: Handler = async (event) => {
         headers["X-Reco-Slug"] = String(chosen.slug || "");
         headers["X-RAG"] = "false";
         headers["X-RAG-Count"] = "0";
+        setCookie(headers, "last_reco_slug", chosen.slug || "");
         await setSessionMem(sessionId, {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
@@ -515,6 +536,7 @@ export const handler: Handler = async (event) => {
         headers["X-Reco-Slug"] = String(chosen.slug || "");
         headers["X-RAG"] = "false";
         headers["X-RAG-Count"] = "0";
+        setCookie(headers, "last_reco_slug", chosen.slug || "");
         await setSessionMem(sessionId, {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: merged } },
@@ -534,7 +556,7 @@ export const handler: Handler = async (event) => {
           "",
           `If you want to proceed, say "yes" or refine (e.g., "biweekly via Slack on Fridays at 2pm").`,
         ].join("\n");
-        headers["X-Route"] = "coach";
+        headers["X-Route"] = "coach"; // informational; not a reco
         headers["X-Reco"] = "false";
         await setSessionMem(sessionId, {
           last_reco_slug: chosen.slug || null,
@@ -548,11 +570,11 @@ export const handler: Handler = async (event) => {
 
       if (follow === "compare") {
         await setSessionMem(sessionId, { last_reco_slug: null, slots: {} });
-        // fall through to router (likely coach)
+        // fall through to router
       }
     }
 
-    // ---- Route & run (Router v2 with confidence, fallback to Router v1) ----
+    // ---- Router per turn (LLM-assisted) ----
     let decision: any = null;
     try {
       const tools = await getToolRegistryCached();
@@ -568,7 +590,7 @@ export const handler: Handler = async (event) => {
         messages: clientMessages as any,
         userText,
         candidates,
-        lastRecoSlug: mem.last_reco_slug,
+        lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
       });
       if (scored && typeof scored.tool_intent_score === "number" && scored.tool_intent_score < 0.65) {
         // ignore low-confidence tool picks; Coach will handle and policy may enforce
@@ -584,16 +606,18 @@ export const handler: Handler = async (event) => {
     if (!decision) decision = await pickRoute(userText, clientMessages as any);
     tAfterRoute = Date.now();
 
+    // ---- Execute chosen path ----
     if (decision.route === "qa") {
       out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
     } else {
-      // Even when router leans "tools", we let Coach craft the guidance;
-      // the policy layer below enforces the internal tool plan and sets X-Route=tools if applied.
+      // Even when router leans "tools", we let Coach craft guidance; policy enforces the tool plan after.
       out = await CoachAgent.handle({ userText, messages: clientMessages });
+      // If later you want speed on obvious tools, swap:
+      // if (decision.route === "tools") out = await ToolsAgent.handle({ userText, messages: clientMessages });
     }
     tAfterAgent = Date.now();
 
-    // ---- Policy: enforce internal tool if matched ----
+    // ---- Policy: enforce internal tool if matched; else strip externals ----
     const tools = await getToolRegistryCached();
     headers["X-Tools-Len"] = String(tools.length);
     const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
@@ -607,10 +631,11 @@ export const handler: Handler = async (event) => {
     let recoSlug: string | null = null;
 
     if (chosen) {
-      const params: PlanParams = {};
+      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
       finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
       recoSlug = chosen.slug || null;
-      headers["X-Route"] = "tools"; // reflect enforcement in headers
+      headers["X-Route"] = "tools"; // reflect enforced plan in telemetry
+      setCookie(headers, "last_reco_slug", recoSlug || "");
       await setSessionMem(sessionId, {
         last_reco_slug: chosen.slug || null,
         slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
