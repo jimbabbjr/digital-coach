@@ -6,6 +6,8 @@ import { route as pickRoute } from "./lib/agents/router";
 import { QaAgent } from "./lib/agents/qa";
 import { CoachAgent } from "./lib/agents/coach";
 import { ToolsAgent } from "./lib/agents/tools";
+import { fetchToolRegistryFlexible, type ToolDocNorm } from "./lib/tools_flex";
+
 
 import type { ToolDoc } from "./lib/tools";
 import {
@@ -33,18 +35,14 @@ const sb =
 // ---------------------------
 
 /** Fetch enabled tools (minimal columns) */
-async function getToolRegistry(): Promise<ToolDoc[]> {
-  if (!sb) return [];
-  const { data } = await sb
-    .from("tool_docs")
-    .select("slug,title,summary,why,outcome,keywords,patterns,enabled")
-    .eq("enabled", true);
-  return (data || []) as unknown as ToolDoc[];
+/** Fetch enabled tools using flexible mapping (no schema assumptions) */
+async function getToolRegistry(): Promise<ToolDocNorm[]> {
+  return await fetchToolRegistryFlexible(sb as any);
 }
 
-/** 5 min in-memory cache for tool registry */
-let TOOL_CACHE: { data: ToolDoc[]; ts: number } | null = null;
-async function getToolRegistryCached(): Promise<ToolDoc[]> {
+/** 5 min in-memory cache */
+let TOOL_CACHE: { data: ToolDocNorm[]; ts: number } | null = null;
+async function getToolRegistryCached(): Promise<ToolDocNorm[]> {
   const now = Date.now();
   if (TOOL_CACHE && now - TOOL_CACHE.ts < 5 * 60_000) return TOOL_CACHE.data;
   const data = await getToolRegistry();
