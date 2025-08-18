@@ -5,7 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import { route as pickRoute } from "./lib/agents/router";
 import { QaAgent } from "./lib/agents/qa";
 import { CoachAgent } from "./lib/agents/coach";
-import { ToolsAgent } from "./lib/agents/tools";
+import { ToolsAgent } from "./lib/agents/tools"; // kept, but we route to Coach for tools turns (see note)
 
 import {
   buildAllowlist,
@@ -13,14 +13,10 @@ import {
   removeExternalToolMentions,
 } from "./lib/sanitize";
 
-import {
-  isAffirmativeFollowUp,
-  getCandidatesFromTools,
-  scoreRouteLLM,
-} from "./lib/agents/router_v2";
+import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 
 // ---------------------------
-// Supabase (optional; telemetry & registry)
+// Supabase (optional; telemetry & session memory & registry)
 // ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -28,7 +24,7 @@ const sb =
     : null;
 
 // ---------------------------
-// Helpers (policy-safe)
+// Types & helpers
 // ---------------------------
 
 /** Canonical Try line */
@@ -36,23 +32,48 @@ function formatTryLine(t: { title: string }) {
   return `Try: ${t.title}`;
 }
 
-/** House plan text (safe, internal) */
-function renderPlanForTool(tool: { title: string; outcome?: string | null }) {
+// ---- Plan params & renderer (supports refinements) ----
+export type PlanParams = {
+  cadence?: "weekly" | "biweekly" | "monthly" | "daily";
+  due_day?: string; // e.g., "Friday"
+  due_time?: string; // e.g., "3pm"
+  channel?: "slack" | "email" | "app";
+  anonymous?: boolean;
+  reminders?: 0 | 1 | 2; // number of nudges
+};
+
+function renderPlanForTool(
+  tool: { title: string; outcome?: string | null },
+  p: PlanParams = {}
+): string {
   const outcome = tool.outcome || "reliable weekly signal without manual chasing";
+  const cadence = p.cadence || "weekly";
+  const day = p.due_day || (cadence === "weekly" ? "Friday" : undefined);
+  const time = p.due_time || "3pm";
+  const channel = p.channel ? p.channel.charAt(0).toUpperCase() + p.channel.slice(1) : "App";
+  const rem = typeof p.reminders === "number" ? p.reminders : 1;
+  const anon = p.anonymous ? " (anonymous collection enabled)" : "";
+
   return [
     `Here’s the fastest path using **${tool.title}**:`,
     "",
-    "- **Set the rhythm:** Pick one submission deadline (e.g., Fridays 3pm).",
+    `- **Set the rhythm:** ${
+      cadence === "weekly"
+        ? "Every week"
+        : cadence === "biweekly"
+        ? "Every other week"
+        : cadence.charAt(0).toUpperCase() + cadence.slice(1)
+    }${day ? ` on ${day}` : ""} at ${time}.`,
     "- **Use the built-in template:** Wins, blockers, next week.",
-    "- **Auto-nudge once:** A single reminder before the deadline.",
-    "- **Model the habit:** Post your own update first.",
-    "- **Close the loop:** Share highlights weekly to show value.",
+    `- **Nudges:** ${rem} reminder${rem === 1 ? "" : "s"} before the deadline via ${channel}.\`,
+    `- **Model the habit:** Post your own update first${anon}.\`,
+    "- **Close the loop:** Share highlights to show value.",
     "",
     `Result: ${outcome}.`,
   ].join("\n");
 }
 
-/** normalize for fuzzy checks */
+// ---- light normalization helpers ----
 function norm(s: string) {
   return String(s || "")
     .toLowerCase()
@@ -60,8 +81,6 @@ function norm(s: string) {
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 }
-
-/** very light token overlap score (0..1) */
 function tokenOverlap(a: string, b: string): number {
   const A = new Set(norm(a).split(" ").filter(Boolean));
   const B = new Set(norm(b).split(" ").filter(Boolean));
@@ -70,13 +89,11 @@ function tokenOverlap(a: string, b: string): number {
   for (const w of A) if (B.has(w)) overlap++;
   return overlap / Math.max(A.size, B.size);
 }
-
 function toList(x: unknown): string[] {
   if (Array.isArray(x)) return x.map((v) => String(v).trim()).filter(Boolean);
   if (x == null) return [];
   const s = String(x);
   if (s.startsWith("{") && s.endsWith("}")) {
-    // pg text[] string form -> {a,b}
     return s
       .slice(1, -1)
       .split(",")
@@ -100,7 +117,8 @@ function isEnabledRow(row: any): boolean {
   return true;
 }
 
-type ToolRow = {
+// ---- Tool row normalization (schema-agnostic) ----
+export type ToolRow = {
   slug: string;
   title: string;
   summary?: string | null;
@@ -112,14 +130,10 @@ type ToolRow = {
   enabled: boolean;
 };
 
-/** Normalize one raw DB row into the shape the app expects (schema-agnostic). */
 function normalizeToolRow(row: any): ToolRow | null {
   if (!row) return null;
-
-  const title =
-    (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) || "";
-  const slug =
-    (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) || "";
+  const title = (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) || "";
+  const slug = (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) || "";
   if (!title || !slug) return null;
 
   const summary = coalesce<string>(row.summary, row.primary_use, row.description) ?? null;
@@ -143,7 +157,6 @@ function normalizeToolRow(row: any): ToolRow | null {
   };
 }
 
-/** Fetch tools using a broad select and normalize to the contract this app needs. */
 async function getToolRegistry(): Promise<ToolRow[]> {
   if (!sb) return [];
   const { data } = await sb.from("tool_docs").select("*");
@@ -155,7 +168,6 @@ async function getToolRegistry(): Promise<ToolRow[]> {
   return out;
 }
 
-/** 5 min in-memory cache for tool registry */
 let TOOL_CACHE: { data: ToolRow[]; ts: number } | null = null;
 async function getToolRegistryCached(): Promise<ToolRow[]> {
   const now = Date.now();
@@ -165,24 +177,14 @@ async function getToolRegistryCached(): Promise<ToolRow[]> {
   return data;
 }
 
-/**
- * Smart intent match:
- * - patterns (regex) → strong signal
- * - keywords overlap
- * - lexical overlap with title/summary/primary_use/content (handles legacy schemas)
- * - tiny hand-tuned boost for common phrases like "weekly report"
- */
+// ---- Smart intent match (patterns + keywords + lexical overlap) ----
 function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
   const text = String(userText || "");
   const lower = text.toLowerCase();
-
-  // quick phrase heuristics
   const hasWeeklyReport = /\bweekly\b.*\b(report|updates?)\b/i.test(text);
 
   let best: { tool: ToolRow; score: number } | null = null;
-
   for (const t of tools) {
-    // title required
     const title = t.title?.trim();
     if (!title) continue;
 
@@ -194,7 +196,6 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     const haystack = [title, summary, why, outcome, content].map(norm).join(" ");
     const user = norm(text);
 
-    // patterns (regex strings)
     const rawPatterns = Array.isArray(t.patterns) ? t.patterns : toList(t.patterns);
     let patternHits = 0;
     for (const rx of rawPatterns) {
@@ -203,35 +204,25 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
       } catch {}
     }
 
-    // keywords (strings/array)
-    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) =>
-      s.toLowerCase()
-    );
+    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) => s.toLowerCase());
     let kwHits = 0;
     for (const k of kws) if (k && lower.includes(k)) kwHits++;
 
-    // lexical overlap via token intersection (Jaccard-like)
     const A = new Set(user.split(" ").filter(Boolean));
     const B = new Set(haystack.split(" ").filter(Boolean));
     let overlap = 0;
     for (const w of A) if (B.has(w)) overlap++;
     const lex = B.size ? overlap / Math.max(A.size, B.size) : 0;
 
-    // score
     let score = patternHits * 2 + kwHits + lex * 3;
-
-    // small hand-tuned boost for "weekly report"-ish prompts when title mentions it
     if (hasWeeklyReport && /\bweekly\b.*\b(report|updates?)\b/.test(title.toLowerCase())) score += 3;
 
     if (!best || score > best.score) best = { tool: t, score };
   }
-
-  // require some signal but keep the bar low so legacy rows match
   if (!best || best.score < 1.0) return null;
   return best.tool;
 }
 
-/** Parse "Try: <candidate>" from assistant text and map to known tool via fuzzy title match */
 function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolRow | null {
   if (!assistantText) return null;
   const m = assistantText.match(/^\s*Try\s*:\s*(.+)$/im);
@@ -245,6 +236,59 @@ function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolR
   }
   if (best && best.score >= 0.7) return best.tool;
   return null;
+}
+
+// ---- Follow-up classification & params parsing ----
+function isAffirmativeFollowUp(text: string): boolean {
+  return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(text);
+}
+function isNegativeFollowUp(text: string): boolean {
+  return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(text);
+}
+function isInfoFollowUp(text: string): boolean {
+  return /\b(what (is|does) it|how (does|would) (it|this) work|explain|more detail|tell me more|why)\b/i.test(text);
+}
+function isCompareFollowUp(text: string): boolean {
+  return /\b(other (options|ways)|alternatives?|compare|vs\.?|versus)\b/i.test(text);
+}
+function parseRefineParams(text: string): PlanParams | null {
+  const t = text.toLowerCase();
+  const p: PlanParams = {};
+  if (/\bbi[-\s]?weekly\b/.test(t)) p.cadence = "biweekly";
+  else if (/\bmonthly\b/.test(t)) p.cadence = "monthly";
+  else if (/\bdaily\b/.test(t)) p.cadence = "daily";
+  else if (/\bweekly\b/.test(t)) p.cadence = "weekly";
+
+  const dayMatch = t.match(/\b(mon|tue|wed|thu|fri|sat|sun)\w*\b/);
+  if (dayMatch) p.due_day = dayMatch[0][0].toUpperCase() + dayMatch[0].slice(1);
+
+  const timeMatch = t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+  if (timeMatch) p.due_time = timeMatch[0];
+
+  if (/\bslack\b/.test(t)) p.channel = "slack";
+  else if (/\bemail\b/.test(t)) p.channel = "email";
+  else if (/(^|\b)(app|in[-\s]?app)\b/.test(t)) p.channel = "app";
+
+  if (/\banonym(ous|ously)?\b/.test(t)) p.anonymous = true;
+
+  if (/\bno (nudge|reminder)s?\b/.test(t)) p.reminders = 0;
+  else if (/\bone (nudge|reminder)\b/.test(t)) p.reminders = 1;
+  else if (/\b(two|2) (nudges|reminders)\b/.test(t)) p.reminders = 2;
+
+  return Object.keys(p).length ? p : null;
+}
+
+type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
+function classifyFollowUp(text: string): FollowKind {
+  if (isAffirmativeFollowUp(text)) return "accept";
+  if (isNegativeFollowUp(text)) return "reject";
+  if (isInfoFollowUp(text)) return "askinfo";
+  if (isCompareFollowUp(text)) return "compare";
+  if (parseRefineParams(text)) return "refine";
+  return "none";
+}
+function mergeParams(a: PlanParams = {}, b: PlanParams = {}): PlanParams {
+  return { ...a, ...b };
 }
 
 // ---- session memory helpers ----
@@ -289,14 +333,12 @@ export const handler: Handler = async (event) => {
     tAfterPolicy = 0,
     tAfterTelemetry = 0;
 
-  // debug flags
   const POLICY_VERSION = "int-tools-hard-override-v1";
   const DEBUG_STAMP = new Date().toISOString();
   const qs = event.queryStringParameters || {};
   const debug = qs.debug === "1";
   const mode = qs.mode || ""; // mode=dry or mode=sim
 
-  // base headers
   const headers: Record<string, string> = {
     "Content-Type": "text/plain; charset=utf-8",
     "Access-Control-Expose-Headers":
@@ -368,13 +410,12 @@ export const handler: Handler = async (event) => {
       };
     }
 
-    // ---- SIM MODE: run policy/tool selection without calling agents/OpenAI ----
+    // ---- SIM MODE: policy/tool selection without OpenAI ----
     if (mode === "sim") {
       let tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
 
-      // if the registry is empty, we won't fabricate a fake tool; we instead let policy clean guidance
-      const allow = buildAllowlist(tools);
+      const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
       const chosen = matchToolByIntent(userText, tools);
 
       let bodyText: string;
@@ -385,7 +426,7 @@ export const handler: Handler = async (event) => {
         route = "tools";
         bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
         recoSlug = chosen.slug || null;
-        await setSessionMem(sessionId, { last_reco_slug: recoSlug, slots: mem.slots });
+        await setSessionMem(sessionId, { last_reco_slug: recoSlug, slots: { proposed: { slug: chosen.slug, title: chosen.title, params: {} } } });
       } else {
         const rogue = [
           "Use Asana or ClickUp for this: https://example.com",
@@ -401,23 +442,21 @@ export const handler: Handler = async (event) => {
       headers["X-Reco"] = String(!!recoSlug);
       if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
 
-      // fire-and-forget telemetry
       if (sb) {
-        const row = {
-          ts: new Date().toISOString(),
-          q: userText.slice(0, 500),
-          route,
-          rag_count: 0,
-          rag_mode: null,
-          model: null,
-          reco_slug: recoSlug,
-          duration_ms: Date.now() - t0,
-          ok: true,
-        };
-        void sb.from("events").insert(row).then(
-          () => {},
-          () => {}
-        );
+        void sb
+          .from("events")
+          .insert({
+            ts: new Date().toISOString(),
+            q: userText.slice(0, 500),
+            route,
+            rag_count: 0,
+            rag_mode: null,
+            model: null,
+            reco_slug: recoSlug,
+            duration_ms: Date.now() - t0,
+            ok: true,
+          })
+          .then(() => {}, () => {});
         headers["X-Events"] = "queued";
       } else {
         headers["X-Events"] = "no-sb";
@@ -429,55 +468,82 @@ export const handler: Handler = async (event) => {
       return { statusCode: 200, headers, body: bodyText.trim() };
     }
 
-    // ---- Affirmative follow-up maps to last recommendation if present ----
-    if (isAffirmativeFollowUp(userText) && mem.last_reco_slug) {
+    // ---- Deterministic follow-up (accept / reject / refine / askinfo / compare) ----
+    const follow = classifyFollowUp(userText);
+    const proposed = (mem.slots && (mem.slots as any).proposed) || (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
+
+    if (proposed) {
       const tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
-      const chosen = tools.find((t) => t.slug === mem.last_reco_slug) || null;
+      const chosen =
+        tools.find((t) => t.slug === proposed.slug) || tools.find((t) => t.title === proposed.title) || null;
 
-      if (chosen) {
-        const finalText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
+      if (follow === "accept" && chosen) {
+        const params = ((proposed as any).params as PlanParams) || {};
+        const finalText = `${renderPlanForTool(chosen, params)}\n\nTry: ${chosen.title}`;
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
         headers["X-Reco-Slug"] = String(chosen.slug || "");
         headers["X-RAG"] = "false";
         headers["X-RAG-Count"] = "0";
+        await setSessionMem(sessionId, {
+          last_reco_slug: chosen.slug || null,
+          slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+        });
+        return { statusCode: 200, headers, body: finalText };
+      }
 
-        // queue telemetry
-        if (sb) {
-          const row = {
-            ts: new Date().toISOString(),
-            q: userText.slice(0, 500),
-            route: "tools",
-            rag_count: 0,
-            rag_mode: null,
-            model: null,
-            reco_slug: chosen.slug || null,
-            duration_ms: Date.now() - t0,
-            ok: true,
-          };
-          void sb.from("events").insert(row).then(
-            () => {},
-            () => {}
-          );
-          headers["X-Events"] = "queued";
-        } else headers["X-Events"] = "no-sb";
+      if (follow === "reject") {
+        await setSessionMem(sessionId, { last_reco_slug: null, slots: {} });
+        // fall through to router
+      }
 
-        headers["X-Events-Stage"] = "success";
-        headers["X-Duration-Total"] = String(Date.now() - t0);
-        headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
-        await setSessionMem(sessionId, { last_reco_slug: mem.last_reco_slug, slots: mem.slots });
-        return { statusCode: 200, headers, body: finalText.trim() };
+      if (follow === "refine" && chosen) {
+        const delta = parseRefineParams(userText) || {};
+        const merged = mergeParams(((proposed as any).params as PlanParams) || {}, delta);
+        const finalText = `${renderPlanForTool(chosen, merged)}\n\nTry: ${chosen.title}`;
+        headers["X-Route"] = "tools";
+        headers["X-Reco"] = "true";
+        headers["X-Reco-Slug"] = String(chosen.slug || "");
+        headers["X-RAG"] = "false";
+        headers["X-RAG-Count"] = "0";
+        await setSessionMem(sessionId, {
+          last_reco_slug: chosen.slug || null,
+          slots: { proposed: { slug: chosen.slug, title: chosen.title, params: merged } },
+        });
+        return { statusCode: 200, headers, body: finalText };
+      }
+
+      if (follow === "askinfo" && chosen) {
+        const blurb = [
+          `**What ${chosen.title} does**`,
+          `- Purpose: ${chosen.summary || "collects quick updates with a simple template."}`,
+          `- Why use it: ${chosen.why || "reduces nagging and increases cadence consistency."}`,
+          `- Outcome: ${chosen.outcome || "you get a reliable weekly signal."}`,
+          "",
+          `If you want to proceed, say "yes" or refine (e.g., "biweekly via Slack on Fridays at 2pm").`,
+        ].join("\n");
+        headers["X-Route"] = "coach"; // informational only
+        headers["X-Reco"] = "false";
+        await setSessionMem(sessionId, {
+          last_reco_slug: chosen.slug || null,
+          slots: { proposed: { slug: chosen.slug, title: chosen.title, params: ((proposed as any).params as PlanParams) || {} } },
+        });
+        return { statusCode: 200, headers, body: blurb };
+      }
+
+      if (follow === "compare") {
+        await setSessionMem(sessionId, { last_reco_slug: null, slots: {} });
+        // fall through to router
       }
     }
 
-    // ---- route & run (Router v2 scoring optional, fallback to v1) ----
+    // ---- Router per turn (LLM-assisted w/ confidence) ----
     let decision: any = null;
     try {
       const tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
       const candidates = getCandidatesFromTools(
-        // map to what router_v2 expects
         tools.map((t) => ({ ...t, enabled: true })) as any,
         userText,
         6
@@ -488,10 +554,10 @@ export const handler: Handler = async (event) => {
         messages: clientMessages as any,
         userText,
         candidates,
-        lastRecoSlug: mem.last_reco_slug,
+        lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
       });
-      if (scored && typeof scored.tool_intent_score === "number" && scored.tool_intent_score < 0.45) {
-        // ignore low-confidence tool picks
+      if (scored && typeof scored.tool_intent_score === "number" && scored.tool_intent_score < 0.65) {
+        // ignore low-confidence tool picks; Coach will handle and policy may enforce
       } else if (scored) {
         decision = {
           route: scored.route,
@@ -504,27 +570,24 @@ export const handler: Handler = async (event) => {
     if (!decision) decision = await pickRoute(userText, clientMessages as any);
     tAfterRoute = Date.now();
 
+    // ---- Execute chosen path
     if (decision.route === "qa") {
       out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
-    } else if (decision.route === "tools") {
-      out = await ToolsAgent.handle({ userText, messages: clientMessages });
     } else {
+      // NOTE: even when router leans "tools", we let Coach craft the guidance, then enforce house policy below.
       out = await CoachAgent.handle({ userText, messages: clientMessages });
+      // If you prefer to skip Coach when route=="tools", call ToolsAgent instead:
+      // if (decision.route === "tools") out = await ToolsAgent.handle({ userText, messages: clientMessages });
     }
     tAfterAgent = Date.now();
 
-    // ---- tool enforcement (hard override, internal only) ----
+    // ---- Policy: enforce internal tool if matched; else strip externals
     const tools = await getToolRegistryCached();
     headers["X-Tools-Len"] = String(tools.length);
-    const allow = buildAllowlist(
-      tools.map((t) => ({ title: t.title })) as any // buildAllowlist expects titles
-    );
+    const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
 
-    // Prefer LLM-picked slug if present; else intent; else Try-line in assistant text
     let chosen: ToolRow | null = null;
-    if (decision?.best_tool_slug) {
-      chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
-    }
+    if (decision?.best_tool_slug) chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
     if (!chosen) chosen = matchToolByIntent(userText, tools);
     if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
 
@@ -532,10 +595,11 @@ export const handler: Handler = async (event) => {
     let recoSlug: string | null = null;
 
     if (chosen) {
-      finalText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`.trim();
+      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
+      finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
       recoSlug = chosen.slug || null;
-      // If we enforced a house tool, advertise tools route in headers
-      headers["X-Route"] = "tools";
+      headers["X-Route"] = "tools"; // reflect enforced plan in telemetry
+      await setSessionMem(sessionId, { last_reco_slug: chosen.slug || null, slots: { proposed: { slug: chosen.slug, title: chosen.title, params } } });
     } else {
       finalText = removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
     }
@@ -554,11 +618,6 @@ export const handler: Handler = async (event) => {
       reco: !!recoSlug,
     };
 
-    // ---- update session memory if we actually recommended ----
-    if (out.reco && out.meta?.recoSlug) {
-      await setSessionMem(sessionId, { last_reco_slug: out.meta.recoSlug, slots: (await getSessionMem(sessionId)).slots });
-    }
-
     // ---- headers ----
     if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
     headers["X-RAG"] = String(!!(decision?.ragMeta?.count ?? 0));
@@ -572,21 +631,20 @@ export const handler: Handler = async (event) => {
     const duration = Date.now() - t0;
     headers["X-Duration-Total"] = String(duration);
     if (sb) {
-      const row = {
-        ts: new Date().toISOString(),
-        q: userText.slice(0, 500),
-        route: headers["X-Route"] || out?.route || decision.route,
-        rag_count: decision?.ragMeta?.count ?? 0,
-        rag_mode: decision?.ragMeta?.mode ?? null,
-        model: decision?.ragMeta?.model ?? null,
-        reco_slug: out?.meta?.recoSlug ?? null,
-        duration_ms: duration,
-        ok: true,
-      };
-      void sb.from("events").insert(row).then(
-        () => {},
-        () => {}
-      );
+      void sb
+        .from("events")
+        .insert({
+          ts: new Date().toISOString(),
+          q: userText.slice(0, 500),
+          route: headers["X-Route"] || out?.route || decision.route,
+          rag_count: decision?.ragMeta?.count ?? 0,
+          rag_mode: decision?.ragMeta?.mode ?? null,
+          model: decision?.ragMeta?.model ?? null,
+          reco_slug: out?.meta?.recoSlug ?? null,
+          duration_ms: duration,
+          ok: true,
+        })
+        .then(() => {}, () => {});
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
@@ -608,24 +666,22 @@ export const handler: Handler = async (event) => {
     const duration = Date.now() - t0;
     headers["X-Duration-Total"] = String(duration);
 
-    // fire-and-forget failure telemetry
     if (sb) {
-      const row = {
-        ts: new Date().toISOString(),
-        q: userText.slice(0, 500),
-        route: out?.route ?? null,
-        rag_count: out?.meta?.rag ?? 0,
-        rag_mode: out?.meta?.ragMode ?? null,
-        model: out?.meta?.model ?? null,
-        reco_slug: out?.meta?.recoSlug ?? null,
-        duration_ms: duration,
-        ok: false,
-        err: String(err?.stack || err?.message || err || "unknown"),
-      };
-      void sb.from("events").insert(row).then(
-        () => {},
-        () => {}
-      );
+      void sb
+        .from("events")
+        .insert({
+          ts: new Date().toISOString(),
+          q: userText.slice(0, 500),
+          route: out?.route ?? null,
+          rag_count: out?.meta?.rag ?? 0,
+          rag_mode: out?.meta?.ragMode ?? null,
+          model: out?.meta?.model ?? null,
+          reco_slug: out?.meta?.recoSlug ?? null,
+          duration_ms: duration,
+          ok: false,
+          err: String(err?.stack || err?.message || err || "unknown"),
+        })
+        .then(() => {}, () => {});
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
