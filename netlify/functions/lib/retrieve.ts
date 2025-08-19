@@ -2,20 +2,17 @@
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 
-type Span = { title?: string; url?: string | null; content: string; score: number };
+type Span = { title?: string | null; url?: string | null; content: string; score: number };
+type Meta = { model: string | null; count: number };
 
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
     ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     : null;
 
-export async function retrieveSpans(opts: {
-  q: string;
-  topK?: number;
-  minScore?: number; // 0..1, cosine-ish scaled
-}) {
+export async function retrieveSpans(opts: { q: string; topK?: number; minScore?: number }): Promise<{spans: Span[]; meta: Meta}> {
   const q = (opts.q || "").slice(0, 4000);
-  if (!q || !sb) return { spans: [] as Span[], meta: { model: null, count: 0 } };
+  if (!q || !sb) return { spans: [], meta: { model: null, count: 0 } };
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
   const embedModel = process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
@@ -23,7 +20,6 @@ export async function retrieveSpans(opts: {
   const vec = emb[0]?.embedding;
   if (!vec) return { spans: [], meta: { model: embedModel, count: 0 } };
 
-  // cosine distance ~ (1 - cosine_sim). We convert to a 0..1 score.
   const topK = opts.topK ?? 4;
   const { data, error } = await sb.rpc("match_docs", {
     query_embedding: vec as any,
@@ -32,13 +28,12 @@ export async function retrieveSpans(opts: {
   if (error || !Array.isArray(data)) return { spans: [], meta: { model: embedModel, count: 0 } };
 
   const spans = (data as any[]).map((r) => ({
-    title: r.title,
-    url: r.url,
+    title: r.title ?? null,
+    url: r.url ?? null,
     content: r.content,
     score: typeof r.similarity === "number" ? r.similarity : 0,
   }));
 
-  // apply optional score floor
   const minScore = opts.minScore ?? 0.72;
   const filtered = spans.filter((s) => s.score >= minScore);
   return { spans: filtered, meta: { model: embedModel, count: filtered.length } };

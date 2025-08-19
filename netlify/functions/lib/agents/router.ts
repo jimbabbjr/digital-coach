@@ -2,7 +2,7 @@
 import { retrieveSpans } from "../retrieve";
 import { getCandidatesFromTools, scoreRouteLLM } from "./router_v2";
 
-type Decision = {
+export type Decision = {
   route: "qa" | "coach" | "tools";
   ragSpans: { content: string }[];
   ragMeta: { count: number; mode: string | null; model: string | null };
@@ -13,7 +13,7 @@ export async function route(userText: string, messages: any[]): Promise<Decision
   const q = String(userText || "");
   const ql = q.toLowerCase();
 
-  // 1) Cheap QA hint → try RAG immediately
+  // 1) Cheap QA hint → try retrieval immediately
   const qaHint =
     /\b(where|link|docs?|document(ed|ation)?|policy|wiki|confluence|notion)\b/.test(ql) ||
     /\b(find|show)\b.*\b(doc|policy|guid(e|eline)s?)\b/.test(ql);
@@ -29,7 +29,7 @@ export async function route(userText: string, messages: any[]): Promise<Decision
     }
   }
 
-  // 2) LLM-assisted router (v2). If it returns, use it.
+  // 2) LLM-assisted router (v2) — optional, safe to fail
   try {
     const candidates = getCandidatesFromTools ? getCandidatesFromTools([], q, 6) : [];
     const scored = await scoreRouteLLM({
@@ -49,7 +49,7 @@ export async function route(userText: string, messages: any[]): Promise<Decision
       };
     }
   } catch {
-    // ignore and fall through
+    // fall through
   }
 
   // 3) Default: coach
