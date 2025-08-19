@@ -202,7 +202,6 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     if (!title) continue;
 
     const summary = t.summary?.trim() || "";
-    the:
     const why = t.why?.trim() || "";
     const outcome = t.outcome?.trim() || "";
     const content = t.content?.trim() || "";
