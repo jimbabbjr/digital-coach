@@ -25,8 +25,8 @@ const sb =
 // ---------------------------
 type PlanParams = {
   cadence?: "weekly" | "biweekly" | "monthly" | "daily";
-  due_day?: string;   // e.g., "Friday"
-  due_time?: string;  // e.g., "3pm"
+  due_day?: string; // e.g., "Friday"
+  due_time?: string; // e.g., "3pm"
   channel?: "slack" | "email" | "app";
   anonymous?: boolean;
   reminders?: 0 | 1 | 2;
@@ -270,7 +270,10 @@ async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | 
       slots: mem.slots ?? {},
       updated_at: new Date().toISOString(),
     })
-    .then(() => {}, () => {});
+    .then(
+      () => {},
+      () => {}
+    );
 }
 
 // --- follow-up classifier & params ---
@@ -282,16 +285,12 @@ function isNegativeFollowUp(text: string): boolean {
   return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(text);
 }
 function isInfoFollowUp(text: string): boolean {
-  // Covers:
-  // - "what is it", "what does it do"
-  // - "what does this tool do", "how does this tool work"
-  // - "what does this do", "how does this work"
-  // - "explain", "more detail", "tell me more", "why"
-  return /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(text)
-      || /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(text)
-      || /\b(explain|more\s+detail|tell\s+me\s+more|why)\b/i.test(text);
+  return (
+    /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(text) ||
+    /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(text) ||
+    /\b(explain|more\s+detail|tell\s+me\s+more|why)\b/i.test(text)
+  );
 }
-
 function isCompareFollowUp(text: string): boolean {
   return /\b(other (options|ways)|alternatives?|compare|vs\.?|versus)\b/i.test(text);
 }
@@ -352,7 +351,7 @@ export const handler: Handler = async (event) => {
   const headers: Record<string, string> = {
     "Content-Type": "text/plain; charset=utf-8",
     "Access-Control-Expose-Headers":
-  "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing, X-Tools-Len, X-Route-Router, X-Router-Impl",
+      "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing, X-Tools-Len, X-Route-Router, X-Router-Impl, X-Coach-RAG-Count",
     "X-Policy-Version": POLICY_VERSION,
     "X-Debug-Stamp": DEBUG_STAMP,
   };
@@ -468,7 +467,10 @@ export const handler: Handler = async (event) => {
             duration_ms: Date.now() - t0,
             ok: true,
           })
-          .then(() => {}, () => {});
+          .then(
+            () => {},
+            () => {}
+          );
         headers["X-Events"] = "queued";
       } else headers["X-Events"] = "no-sb";
 
@@ -569,7 +571,13 @@ export const handler: Handler = async (event) => {
         headers["X-Reco"] = "false";
         await setSessionMem(sessionId, {
           last_reco_slug: chosen.slug || null,
-          slots: { proposed: { slug: chosen.slug, title: chosen.title, params: ((proposed as any).params as PlanParams) || {} } },
+          slots: {
+            proposed: {
+              slug: chosen.slug,
+              title: chosen.title,
+              params: ((proposed as any).params as PlanParams) || {},
+            },
+          },
         });
         headers["X-Events-Stage"] = "success";
         headers["X-Duration-Total"] = String(Date.now() - t0);
@@ -584,57 +592,67 @@ export const handler: Handler = async (event) => {
     }
 
     // ---- Router per turn (QA-first) ----
-let decision: any = await pickRoute(userText, clientMessages as any);
+    let decision: any = await pickRoute(userText, clientMessages as any);
 
-// optional: let LLM scorer weigh in ONLY if not already QA with spans
-const alreadyQA = decision?.route === "qa" && (decision?.ragMeta?.count ?? 0) > 0;
+    // optional: let LLM scorer weigh in ONLY if not already QA with spans
+    const alreadyQA = decision?.route === "qa" && (decision?.ragMeta?.count ?? 0) > 0;
 
-if (!alreadyQA) {
-  try {
-    const tools = await getToolRegistryCached();
-    headers["X-Tools-Len"] = String(tools.length);
-    const candidates = getCandidatesFromTools ? getCandidatesFromTools(tools as any, userText, 6) : [];
-    const scored = await scoreRouteLLM({
-      apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-      messages: clientMessages as any,
-      userText,
-      candidates,
-      lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
-    });
+    if (!alreadyQA) {
+      try {
+        const tools = await getToolRegistryCached();
+        headers["X-Tools-Len"] = String(tools.length);
+        const candidates = getCandidatesFromTools ? getCandidatesFromTools(tools as any, userText, 6) : [];
+        const scored = await scoreRouteLLM({
+          apiKey: process.env.OPENAI_API_KEY,
+          model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+          messages: clientMessages as any,
+          userText,
+          candidates,
+          lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
+        });
 
-    // Only accept the scorer if it’s confident AND not QA
-    if (scored && scored.route !== "qa" && (scored.tool_intent_score ?? 0) >= 0.65) {
-      decision = {
-        route: scored.route,
-        ragSpans: [],
-        ragMeta: { count: 0, mode: null, model: null },
-        best_tool_slug: scored.best_tool_slug,
-        impl: (decision as any)?.impl || "qa-first-v2+llm",
-      };
+        // Only accept the scorer if it’s confident AND not QA
+        if (scored && scored.route !== "qa" && (scored.tool_intent_score ?? 0) >= 0.65) {
+          decision = {
+            route: scored.route,
+            ragSpans: [],
+            ragMeta: { count: 0, mode: null, model: null },
+            best_tool_slug: scored.best_tool_slug,
+            impl: (decision as any)?.impl || "qa-first-v2+llm",
+          };
+        }
+      } catch {
+        // ignore scorer failures; keep QA-first decision
+      }
     }
-  } catch {
-    // ignore scorer failures; keep QA-first decision
-  }
-}
 
-// expose router debug
-headers["X-Route-Router"] = String(decision?.route || "");
-if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any).impl);
+    // expose router debug
+    headers["X-Route-Router"] = String(decision?.route || "");
+    if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any).impl);
     tAfterRoute = Date.now();
 
     // ---- Execute chosen path ----
-let coachGround: { title?: string|null; url?: string|null; content: string; score?: number }[] = [];
+    type Span = { title?: string | null; url?: string | null; content: string; score?: number };
 
-if (decision.route === "qa") {
-  out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
-} else {
-  // Fast retrieval to ground coach answers in internal principles
-  const g = await retrieveSpans({ q: userText, topK: 3, minScore: 0.55 });
-  coachGround = g.spans;
-  out = await CoachAgent.handle({ userText, messages: clientMessages, grounding: coachGround });
-}
-tAfterAgent = Date.now();
+    function expandForGrounding(q: string): string {
+      // light synonym expansion so embeddings “get” the intent
+      return q
+        .replace(/\b1[:\-]1s?\b/gi, "one-on-one meetings")
+        .replace(/\bone on ones?\b/gi, "one-on-one meetings")
+        .replace(/\bone to ones?\b/gi, "one-on-one meetings");
+    }
+
+    let coachGround: Span[] = [];
+
+    if (decision.route === "qa") {
+      out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
+    } else {
+      const qGround = expandForGrounding(userText);
+      const g = await retrieveSpans({ q: qGround, topK: 3, minScore: 0.55 });
+      coachGround = g.spans;
+      out = await CoachAgent.handle({ userText, messages: clientMessages, grounding: coachGround });
+    }
+    tAfterAgent = Date.now();
 
     // ---- Policy: enforce internal tool if matched; else strip externals ----
     const tools = await getToolRegistryCached();
@@ -647,63 +665,62 @@ tAfterAgent = Date.now();
     if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
 
     let finalText: string;
-let recoSlug: string | null = null;
+    let recoSlug: string | null = null;
 
-// treat any routed QA with nonzero spans as QA; don't enforce tools on it
-const isQA = (decision?.route === "qa") && ((decision?.ragMeta?.count ?? 0) > 0);
+    // treat any routed QA with nonzero spans as QA; don't enforce tools on it
+    const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
 
-if (!isQA && chosen) {
-  const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
-  finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
-  recoSlug = chosen.slug || null;
-  headers["X-Route"] = "tools";
-  setCookie(headers, "last_reco_slug", recoSlug || "");
-  await setSessionMem(sessionId, {
-    last_reco_slug: chosen.slug || null,
-    slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
-  });
-} else {
-  // QA: keep the agent’s answer as-is; non-QA: still strip externals
-  finalText = isQA ? (out?.text ?? "") : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
-}
+    if (!isQA && chosen) {
+      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
+      finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
+      recoSlug = chosen.slug || null;
+      headers["X-Route"] = "tools";
+      setCookie(headers, "last_reco_slug", recoSlug || "");
+      await setSessionMem(sessionId, {
+        last_reco_slug: chosen.slug || null,
+        slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+      });
+    } else {
+      // QA: keep the agent’s answer as-is; non-QA: still strip externals
+      finalText = isQA ? out?.text ?? "" : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
+    }
     tAfterPolicy = Date.now();
 
+    // preserve agent meta; only inject router RAG for QA
     const mergedMeta: any = { ...(out?.meta || {}), recoSlug };
-if (decision?.route === "qa") {
-  mergedMeta.rag     = decision?.ragMeta?.count ?? 0;
-  mergedMeta.ragMode = decision?.ragMeta?.mode  ?? "raw";
-  mergedMeta.model   = decision?.ragMeta?.model ?? mergedMeta.model ?? null;
-}
-out = {
-  ...(out || { text: "", route: decision.route }),
-  text: finalText,
-  meta: mergedMeta,
-  reco: !!recoSlug,
-};
+    if (decision?.route === "qa") {
+      mergedMeta.rag = decision?.ragMeta?.count ?? 0;
+      mergedMeta.ragMode = decision?.ragMeta?.mode ?? "raw";
+      mergedMeta.model = decision?.ragMeta?.model ?? mergedMeta.model ?? null;
+    }
 
-   // ---- headers ----
-if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
+    out = {
+      ...(out || { text: "", route: decision.route }),
+      text: finalText,
+      meta: mergedMeta,
+      reco: !!recoSlug,
+    };
 
-// router spans + (coach grounding only)
-const ragFromRouter = Number(decision?.ragMeta?.count ?? 0);
-const ragFromAgent  = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? 0);
-const totalRagCount = ragFromRouter + ragFromAgent;
+    // ---- headers ----
+    if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
 
-headers["X-RAG"]       = String(totalRagCount > 0);
-headers["X-RAG-Count"] = String(totalRagCount);
+    // router spans + (coach grounding only)
+    const ragFromRouter = Number(decision?.ragMeta?.count ?? 0);
+    const ragFromAgent = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? 0);
+    const totalRagCount = ragFromRouter + ragFromAgent;
 
-// Prefer router’s mode/model; fall back to agent’s (coach grounding)
-const ragMode    = decision?.ragMeta?.mode  ?? (out as any)?.meta?.ragMode ?? null;
-const embedModel = decision?.ragMeta?.model ?? (out as any)?.meta?.model   ?? null;
-if (ragMode)    headers["X-RAG-Mode"]    = String(ragMode);
-if (embedModel) headers["X-Embed-Model"] = String(embedModel);
+    headers["X-RAG"] = String(totalRagCount > 0);
+    headers["X-RAG-Count"] = String(totalRagCount);
+    headers["X-Coach-RAG-Count"] = String(ragFromAgent);
 
-headers["X-Reco"] = String(!!out?.reco);
-if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
+    // Prefer router’s mode/model; fall back to agent’s (coach grounding)
+    const ragMode = decision?.ragMeta?.mode ?? (out as any)?.meta?.ragMode ?? null;
+    const embedModel = decision?.ragMeta?.model ?? (out as any)?.meta?.model ?? null;
+    if (ragMode) headers["X-RAG-Mode"] = String(ragMode);
+    if (embedModel) headers["X-Embed-Model"] = String(embedModel);
 
-// (optional for quick debugging)
-headers["X-Coach-RAG-Count"] = String(ragFromAgent);
-
+    headers["X-Reco"] = String(!!out?.reco);
+    if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
 
     // ---- telemetry (fire-and-forget) ----
     const duration = Date.now() - t0;
@@ -715,14 +732,17 @@ headers["X-Coach-RAG-Count"] = String(ragFromAgent);
           ts: new Date().toISOString(),
           q: userText.slice(0, 500),
           route: headers["X-Route"] || out?.route || decision.route,
-          rag_count: decision?.ragMeta?.count ?? 0,
-          rag_mode: decision?.ragMeta?.mode ?? null,
-          model: decision?.ragMeta?.model ?? null,
+          rag_count: totalRagCount,
+          rag_mode: ragMode,
+          model: embedModel,
           reco_slug: out?.meta?.recoSlug ?? null,
           duration_ms: duration,
           ok: true,
         })
-        .then(() => {}, () => {});
+        .then(
+          () => {},
+          () => {}
+        );
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
@@ -759,7 +779,10 @@ headers["X-Coach-RAG-Count"] = String(ragFromAgent);
           ok: false,
           err: String(err?.stack || err?.message || err || "unknown"),
         })
-        .then(() => {}, () => {});
+        .then(
+          () => {},
+          () => {}
+        );
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
