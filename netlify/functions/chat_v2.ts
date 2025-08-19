@@ -11,7 +11,10 @@ import {
   buildAllowlist,
   stripAllTryLines,
   removeExternalToolMentions,
+  renumberOrderedLists,
+  sanitizeNeutralGuidance,
 } from "./lib/sanitize";
+
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 import { retrieveSpans } from "./lib/retrieve";
 
@@ -20,10 +23,7 @@ import { retrieveSpans } from "./lib/retrieve";
 // ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(
-        process.env.SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY!
-      )
+    ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     : null;
 
 const CONVO_TABLE = process.env.CONVO_TABLE || "conversations";
@@ -44,17 +44,12 @@ function formatTryLine(t: { title: string }) {
   return `Try: ${t.title}`;
 }
 
-function renderPlanForTool(
-  tool: { title: string; outcome?: string | null },
-  p: PlanParams = {}
-) {
+function renderPlanForTool(tool: { title: string; outcome?: string | null }, p: PlanParams = {}) {
   const outcome = tool.outcome || "reliable weekly signal without manual chasing";
   const cadence = p.cadence || "weekly";
   const day = p.due_day || (cadence === "weekly" ? "Friday" : undefined);
   const time = p.due_time || "3pm";
-  const channel = p.channel
-    ? p.channel.charAt(0).toUpperCase() + p.channel.slice(1)
-    : "App";
+  const channel = p.channel ? p.channel.charAt(0).toUpperCase() + p.channel.slice(1) : "App";
   const rem = typeof p.reminders === "number" ? p.reminders : 1;
   const anon = p.anonymous ? " (anonymous collection enabled)" : "";
 
@@ -79,11 +74,7 @@ function renderPlanForTool(
 
 // --- text utils ---
 function norm(s: string) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/\btool\b/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+  return String(s || "").toLowerCase().replace(/\btool\b/g, "").replace(/[^a-z0-9]+/g, " ").trim();
 }
 function tokenOverlap(a: string, b: string): number {
   const A = new Set(norm(a).split(" ").filter(Boolean));
@@ -107,24 +98,16 @@ function toList(x: unknown): string[] {
   return s.split(",").map((v) => v.trim()).filter(Boolean);
 }
 function kebab(s?: string | null) {
-  return String(s ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  return String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 function coalesce<T>(...vals: T[]): T | undefined {
-  for (const v of vals)
-    if (v !== undefined && v !== null && String(v) !== "") return v;
+  for (const v of vals) if (v !== undefined && v !== null && String(v) !== "") return v;
   return undefined;
 }
 function isEnabledRow(row: any): boolean {
-  const v =
-    row?.enabled ?? row?.is_enabled ?? row?.active ?? row?.is_active ?? row?.status;
+  const v = row?.enabled ?? row?.is_enabled ?? row?.active ?? row?.is_active ?? row?.status;
   if (typeof v === "boolean") return v;
-  if (typeof v === "string")
-    return ["1", "true", "t", "y", "yes", "active", "enabled"].includes(
-      v.toLowerCase()
-    );
+  if (typeof v === "string") return ["1", "true", "t", "y", "yes", "active", "enabled"].includes(v.toLowerCase());
   if (typeof v === "number") return v > 0;
   return true;
 }
@@ -161,12 +144,8 @@ type ToolRow = {
 function normalizeToolRow(row: any): ToolRow | null {
   if (!row) return null;
 
-  const title =
-    (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) ||
-    "";
-  const slug =
-    (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) ||
-    "";
+  const title = (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) || "";
+  const slug = (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) || "";
   if (!title || !slug) return null;
 
   const summary = coalesce<string>(row.summary, row.primary_use, row.description) ?? null;
@@ -223,6 +202,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     if (!title) continue;
 
     const summary = t.summary?.trim() || "";
+    the:
     const why = t.why?.trim() || "";
     const outcome = t.outcome?.trim() || "";
     const content = t.content?.trim() || "";
@@ -240,9 +220,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     }
 
     // keywords
-    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) =>
-      s.toLowerCase()
-    );
+    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) => s.toLowerCase());
     let kwHits = 0;
     for (const k of kws) if (k && lower.includes(k)) kwHits++;
 
@@ -254,8 +232,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     const lex = B.size ? overlap / Math.max(A.size, B.size) : 0;
 
     let score = patternHits * 2 + kwHits + lex * 3;
-    if (hasWeeklyReport && /\bweekly\b.*\b(report|updates?)\b/.test(title.toLowerCase()))
-      score += 3;
+    if (hasWeeklyReport && /\bweekly\b.*\b(report|updates?)\b/.test(title.toLowerCase())) score += 3;
 
     if (!best || score > best.score) best = { tool: t, score };
   }
@@ -263,10 +240,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
   return best.tool;
 }
 
-function detectToolFromAssistant(
-  assistantText: string,
-  tools: ToolRow[]
-): ToolRow | null {
+function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolRow | null {
   if (!assistantText) return null;
   const m = assistantText.match(/^\s*Try\s*:\s*(.+)$/im);
   const candidate = m?.[1]?.trim();
@@ -274,8 +248,7 @@ function detectToolFromAssistant(
 
   let best: { tool: ToolRow; score: number } | null = null;
   for (const t of tools) {
-    const s =
-      norm(t.title) === norm(candidate) ? 1 : tokenOverlap(t.title, candidate);
+    const s = norm(t.title) === norm(candidate) ? 1 : tokenOverlap(t.title, candidate);
     if (!best || s > best.score) best = { tool: t, score: s };
   }
   if (best && best.score >= 0.7) return best.tool;
@@ -289,7 +262,6 @@ type MemRow = { last_reco_slug: string | null; slots: any };
 
 async function getMem(userId: string | null, sessionId: string): Promise<MemRow> {
   if (!sb) return { last_reco_slug: null, slots: {} };
-  // try user-level first (if provided)
   if (userId) {
     const { data } = await sb
       .from("session_memory")
@@ -298,7 +270,6 @@ async function getMem(userId: string | null, sessionId: string): Promise<MemRow>
       .maybeSingle();
     if (data) return { last_reco_slug: (data as any).last_reco_slug ?? null, slots: (data as any).slots ?? {} };
   }
-  // fallback to session-level
   const { data } = await sb
     .from("session_memory")
     .select("last_reco_slug, slots")
@@ -307,11 +278,7 @@ async function getMem(userId: string | null, sessionId: string): Promise<MemRow>
   return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
 }
 
-async function setMem(
-  userId: string | null,
-  sessionId: string,
-  mem: { last_reco_slug: string | null; slots?: any }
-) {
+async function setMem(userId: string | null, sessionId: string, mem: { last_reco_slug: string | null; slots?: any }) {
   if (!sb) return;
   const payload: any = {
     session_id: sessionId,
@@ -324,7 +291,6 @@ async function setMem(
   try {
     await sb.from("session_memory").upsert(payload);
   } catch {
-    // retry without user_id if that column doesn't exist
     delete payload.user_id;
     try {
       await sb.from("session_memory").upsert(payload);
@@ -349,18 +315,11 @@ type LogRow = {
 
 async function logMessage(row: LogRow) {
   if (!sb) return;
-  // try enriched insert
   try {
     await sb.from(CONVO_TABLE).insert(row as any);
     return;
   } catch {
-    // fall back to minimal columns
-    const minimal = {
-      ts: row.ts,
-      session_id: row.session_id,
-      role: row.role,
-      content: row.content,
-    };
+    const minimal = { ts: row.ts, session_id: row.session_id, role: row.role, content: row.content };
     try {
       await sb.from(CONVO_TABLE).insert(minimal as any);
     } catch {
@@ -374,23 +333,15 @@ async function logMessage(row: LogRow) {
 // ---------------------------
 type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
 function isAffirmativeFollowUp(text: string): boolean {
-  return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(
-    text
-  );
+  return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(text);
 }
 function isNegativeFollowUp(text: string): boolean {
-  return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(
-    text
-  );
+  return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(text);
 }
 function isInfoFollowUp(text: string): boolean {
   return (
-    /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(
-      text
-    ) ||
-    /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(
-      text
-    ) ||
+    /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(text) ||
+    /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(text) ||
     /\b(explain|more\s+detail|tell\s+me\s+more|why)\b/i.test(text)
   );
 }
@@ -468,11 +419,7 @@ export const handler: Handler = async (event) => {
       headers["X-Route"] = "noop";
       headers["X-Duration-Total"] = String(Date.now() - t0);
       headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ ok: true, note: "debug GET ok", policy: POLICY_VERSION }),
-      };
+      return { statusCode: 200, headers, body: JSON.stringify({ ok: true, note: "debug GET ok", policy: POLICY_VERSION }) };
     }
     headers["X-Events-Stage"] = "405";
     headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
@@ -485,12 +432,7 @@ export const handler: Handler = async (event) => {
         text: string;
         route: "qa" | "coach" | "tools" | string;
         reco?: boolean;
-        meta?: {
-          rag?: number;
-          ragMode?: string | null;
-          model?: string | null;
-          recoSlug?: string | null;
-        };
+        meta?: { rag?: number; ragMode?: string | null; model?: string | null; recoSlug?: string | null };
       }
     | null = null;
 
@@ -500,21 +442,13 @@ export const handler: Handler = async (event) => {
     const clientMessages = Array.isArray(body?.messages) ? body.messages : [];
     userText =
       body?.q ??
-      [...clientMessages].reverse().find(
-        (m: any) => m?.role === "user" && typeof m?.content === "string"
-      )?.content ??
+      [...clientMessages].reverse().find((m: any) => m?.role === "user" && typeof m?.content === "string")?.content ??
       "";
     userText = String(userText).trim();
     const sessionId: string =
-      body.sessionId ||
-      (event.headers["x-session-id"] as string) ||
-      (event.headers["X-Session-Id"] as string) ||
-      "anon";
+      body.sessionId || (event.headers["x-session-id"] as string) || (event.headers["X-Session-Id"] as string) || "anon";
     const userId: string | null =
-      body.userId ||
-      (event.headers["x-user-id"] as string) ||
-      (event.headers["X-User-Id"] as string) ||
-      null;
+      body.userId || (event.headers["x-user-id"] as string) || (event.headers["X-User-Id"] as string) || null;
 
     headers["X-Events-Stage"] = "parsed";
 
@@ -547,6 +481,7 @@ export const handler: Handler = async (event) => {
       if (chosen) {
         route = "tools";
         bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
+        bodyText = renumberOrderedLists(bodyText);
         recoSlug = chosen.slug || null;
         setCookie(headers, "last_reco_slug", recoSlug || "");
         await setMem(userId, sessionId, {
@@ -559,7 +494,7 @@ export const handler: Handler = async (event) => {
           "Alternatively, Microsoft Teams could work.",
           "Try: Random External Tool",
         ].join("\n");
-        bodyText = removeExternalToolMentions(stripAllTryLines(rogue), allow);
+        bodyText = sanitizeNeutralGuidance(rogue, allow);
       }
 
       headers["X-Route"] = route;
@@ -568,7 +503,6 @@ export const handler: Handler = async (event) => {
       headers["X-Reco"] = String(!!recoSlug);
       if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
 
-      // best-effort transcript
       const ts = new Date().toISOString();
       void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
       void logMessage({
@@ -592,16 +526,12 @@ export const handler: Handler = async (event) => {
     // ---- Deterministic follow-up layer ----
     const follow = classifyFollowUp(userText);
 
-    // 1) from memory (user preferred)
-    let proposed =
-      (mem.slots && (mem.slots as any).proposed) ||
-      (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
+    // 1) memory (user first)
+    let proposed = (mem.slots && (mem.slots as any).proposed) || (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
 
-    // 2) from last assistant Try: (requires messages[])
+    // 2) last assistant Try:
     if (!proposed) {
-      const lastAssistantText =
-        [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")
-          ?.content || "";
+      const lastAssistantText = [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")?.content || "";
       if (lastAssistantText) {
         const toolsForDetect = await getToolRegistryCached();
         const det = detectToolFromAssistant(lastAssistantText, toolsForDetect);
@@ -609,12 +539,9 @@ export const handler: Handler = async (event) => {
       }
     }
 
-    // 3) cookie fallback
+    // 3) cookie
     if (!proposed) {
-      const ck =
-        (event.headers["cookie"] as string) ||
-        (event.headers["Cookie"] as string) ||
-        "";
+      const ck = (event.headers["cookie"] as string) || (event.headers["Cookie"] as string) || "";
       const slugFromCookie = getCookie("last_reco_slug", ck);
       if (slugFromCookie) proposed = { slug: slugFromCookie };
     }
@@ -623,13 +550,12 @@ export const handler: Handler = async (event) => {
       const tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
       const chosen =
-        tools.find((t) => t.slug === (proposed as any).slug) ||
-        tools.find((t) => t.title === (proposed as any).title) ||
-        null;
+        tools.find((t) => t.slug === (proposed as any).slug) || tools.find((t) => t.title === (proposed as any).title) || null;
 
       if (follow === "accept" && chosen) {
         const params = ((proposed as any).params as PlanParams) || {};
-        const finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`;
+        let finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`;
+        finalText = renumberOrderedLists(finalText);
 
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
@@ -670,7 +596,8 @@ export const handler: Handler = async (event) => {
       if (follow === "refine" && chosen) {
         const delta = parseRefineParams(userText) || {};
         const merged = mergeParams(((proposed as any).params as PlanParams) || {}, delta);
-        const finalText = `${renderPlanForTool(chosen, merged)}\n\n${formatTryLine(chosen)}`;
+        let finalText = `${renderPlanForTool(chosen, merged)}\n\n${formatTryLine(chosen)}`;
+        finalText = renumberOrderedLists(finalText);
 
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
@@ -756,9 +683,7 @@ export const handler: Handler = async (event) => {
       try {
         const tools = await getToolRegistryCached();
         headers["X-Tools-Len"] = String(tools.length);
-        const candidates = getCandidatesFromTools
-          ? getCandidatesFromTools(tools as any, userText, 6)
-          : [];
+        const candidates = getCandidatesFromTools ? getCandidatesFromTools(tools as any, userText, 6) : [];
         const scored = await scoreRouteLLM({
           apiKey: process.env.OPENAI_API_KEY,
           model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
@@ -802,27 +727,15 @@ export const handler: Handler = async (event) => {
     let coachGround: Span[] = [];
 
     if (decision.route === "qa") {
-      out = await QaAgent.handle({
-        userText,
-        messages: clientMessages,
-        ragSpans: decision.ragSpans,
-      });
+      out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
     } else {
       const qGround = expandForGrounding(userText);
       let g = await retrieveSpans({ q: qGround, topK: 3, minScore: 0.55 });
       if (!g.spans?.length) {
-        g = await retrieveSpans({
-          q: `${qGround} agenda cadence expectations`,
-          topK: 3,
-          minScore: 0.45,
-        });
+        g = await retrieveSpans({ q: `${qGround} agenda cadence expectations`, topK: 3, minScore: 0.45 });
       }
       coachGround = g.spans || [];
-      out = await CoachAgent.handle({
-        userText,
-        messages: clientMessages,
-        grounding: coachGround,
-      });
+      out = await CoachAgent.handle({ userText, messages: clientMessages, grounding: coachGround });
     }
     tAfterAgent = Date.now();
 
@@ -831,35 +744,32 @@ export const handler: Handler = async (event) => {
     headers["X-Tools-Len"] = String(tools.length);
     const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
 
-    let chosen: ToolRow | null = null;
-    if (decision?.best_tool_slug)
-      chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
-    if (!chosen) chosen = matchToolByIntent(userText, tools);
-    if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
+    let chosenTool: ToolRow | null = null;
+    if (decision?.best_tool_slug) chosenTool = tools.find((t) => t.slug === decision.best_tool_slug) || null;
+    if (!chosenTool) chosenTool = matchToolByIntent(userText, tools);
+    if (!chosenTool) chosenTool = detectToolFromAssistant(out?.text ?? "", tools);
 
-    const qaLike =
-      /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
+    const qaLike = /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
 
-    let finalText: string;
+    let finalText = "";
     let recoSlug: string | null = null;
 
     // treat any routed QA with nonzero spans as QA; don't enforce tools on it
     const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
 
-    if (!isQA && !qaLike && chosen) {
+    if (!isQA && !qaLike && chosenTool) {
       const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
-      finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
-      recoSlug = chosen.slug || null;
+      finalText = `${renderPlanForTool(chosenTool, params)}\n\n${formatTryLine(chosenTool)}`.trim();
+      finalText = renumberOrderedLists(finalText);
+      recoSlug = chosenTool.slug || null;
       headers["X-Route"] = "tools";
       setCookie(headers, "last_reco_slug", recoSlug || "");
       await setMem(userId, sessionId, {
-        last_reco_slug: chosen.slug || null,
-        slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+        last_reco_slug: chosenTool.slug || null,
+        slots: { proposed: { slug: chosenTool.slug, title: chosenTool.title, params } },
       });
     } else {
-      finalText = isQA
-        ? out?.text ?? ""
-        : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
+      finalText = isQA ? out?.text ?? "" : sanitizeNeutralGuidance(out?.text ?? "", allow);
     }
     tAfterPolicy = Date.now();
 
@@ -884,13 +794,7 @@ export const handler: Handler = async (event) => {
 
     // ---- Log transcript (user + assistant) ----
     const ts = new Date().toISOString();
-    void logMessage({
-      ts,
-      session_id: sessionId,
-      user_id: userId,
-      role: "user",
-      content: userText,
-    });
+    void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
     void logMessage({
       ts,
       session_id: sessionId,
@@ -910,7 +814,7 @@ export const handler: Handler = async (event) => {
       void sb
         .from("events")
         .insert({
-          ts: ts,
+          ts,
           q: userText.slice(0, 500),
           route: headers["X-Route"] || decision.route,
           rag_count: totalRagCount,
@@ -920,10 +824,7 @@ export const handler: Handler = async (event) => {
           duration_ms: duration,
           ok: true,
         })
-        .then(
-          () => {},
-          () => {}
-        );
+        .then(() => {}, () => {});
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
@@ -961,10 +862,7 @@ export const handler: Handler = async (event) => {
           ok: false,
           err: String(err?.stack || err?.message || err || "unknown"),
         })
-        .then(
-          () => {},
-          () => {}
-        );
+        .then(() => {}, () => {});
       headers["X-Events"] = "queued";
     } else {
       headers["X-Events"] = "no-sb";
@@ -972,20 +870,16 @@ export const handler: Handler = async (event) => {
 
     headers["X-Events-Stage"] = "error";
     headers["Server-Timing"] = [
-      `route;dur=${Math.max(0, 0)}`,
-      `agent;dur=0`,
-      `policy;dur=0`,
+      `route;dur=${Math.max(0, tAfterRoute - t0)}`,
+      `agent;dur=${tAfterAgent && tAfterRoute ? tAfterAgent - tAfterRoute : 0}`,
+      `policy;dur=${tAfterPolicy && tAfterAgent ? tAfterPolicy - tAfterAgent : 0}`,
       `telemetry;dur=${Date.now() - (tAfterPolicy || t0)}`,
       `total;dur=${Date.now() - t0}`,
     ].join(", ");
 
     if (debug) {
       headers["Content-Type"] = "application/json; charset=utf-8";
-      const body = JSON.stringify(
-        { ok: false, error: String(err?.message || err), stack: String(err?.stack || "") },
-        null,
-        2
-      );
+      const body = JSON.stringify({ ok: false, error: String(err?.message || err), stack: String(err?.stack || "") }, null, 2);
       return { statusCode: 200, headers, body };
     }
 

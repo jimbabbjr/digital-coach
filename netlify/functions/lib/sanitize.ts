@@ -133,3 +133,38 @@ export function enforceInternalTool(
   // collapse blank runs
   return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
+// --- add near the bottom of sanitize.ts ---
+
+/** Renumber contiguous ordered-list blocks (1., 2., 3.) after filtering */
+export function renumberOrderedLists(text: string): string {
+  if (!text) return "";
+  const lines = text.split("\n");
+
+  const numRe = /^\s*(\d+)[\.\)]\s+/;  // 1.  or 1)
+  let inBlock = false;
+  let n = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+
+    if (numRe.test(ln)) {
+      if (!inBlock) { inBlock = true; n = 1; } else { n += 1; }
+      lines[i] = ln.replace(numRe, `${n}. `);
+      continue;
+    }
+
+    // reset when we hit a blank line or a bullet/subheading
+    if (!ln.trim() || /^\s*[-•]/.test(ln) || /^\s*#{1,6}\s/.test(ln)) {
+      inBlock = false; n = 0;
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/** One-shot cleanup for neutral guidance: strip Try lines & externals, then renumber */
+export function sanitizeNeutralGuidance(text: string, allow: Set<string>): string {
+  const stripped = removeExternalToolMentions(stripAllTryLines(text), allow);
+  return renumberOrderedLists(stripped);
+}
+
