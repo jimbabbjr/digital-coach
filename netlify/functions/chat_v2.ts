@@ -613,7 +613,9 @@ export const handler: Handler = async (event) => {
     } catch {}
     if (!decision) decision = await pickRoute(userText, clientMessages as any);
     // --- debug: what the router decided ---
+// --- after the line that assigns `decision` ---
 headers["X-Route-Router"] = String(decision?.route || "");
+headers["X-Router-Impl"]  = String((decision as any)?.impl || "");
 if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any).impl);
     tAfterRoute = Date.now();
 
