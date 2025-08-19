@@ -16,7 +16,7 @@ import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 import { retrieveSpans } from "./lib/retrieve";
 
 // ---------------------------
-// Supabase (optional; telemetry & registry & session memory)
+// Supabase (telemetry, registry, memory, transcripts)
 // ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -25,6 +25,8 @@ const sb =
         process.env.SUPABASE_SERVICE_ROLE_KEY!
       )
     : null;
+
+const CONVO_TABLE = process.env.CONVO_TABLE || "conversations";
 
 // ---------------------------
 // Types & helpers
@@ -280,40 +282,96 @@ function detectToolFromAssistant(
   return null;
 }
 
-// --- session memory helpers (optional; SERVICE_ROLE only) ---
-async function getSessionMem(sessionId: string) {
-  if (!sb || !sessionId)
-    return { last_reco_slug: null as string | null, slots: {} as any };
+// ---------------------------
+// Memory (user-level preferred; fallback to session)
+// ---------------------------
+type MemRow = { last_reco_slug: string | null; slots: any };
+
+async function getMem(userId: string | null, sessionId: string): Promise<MemRow> {
+  if (!sb) return { last_reco_slug: null, slots: {} };
+  // try user-level first (if provided)
+  if (userId) {
+    const { data } = await sb
+      .from("session_memory")
+      .select("last_reco_slug, slots")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (data) return { last_reco_slug: (data as any).last_reco_slug ?? null, slots: (data as any).slots ?? {} };
+  }
+  // fallback to session-level
   const { data } = await sb
     .from("session_memory")
     .select("last_reco_slug, slots")
     .eq("session_id", sessionId)
     .maybeSingle();
-  return {
-    last_reco_slug: (data as any)?.last_reco_slug ?? null,
-    slots: (data as any)?.slots ?? {},
-  };
+  return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
 }
-async function setSessionMem(
+
+async function setMem(
+  userId: string | null,
   sessionId: string,
   mem: { last_reco_slug: string | null; slots?: any }
 ) {
-  if (!sb || !sessionId) return;
-  void sb
-    .from("session_memory")
-    .upsert({
-      session_id: sessionId,
-      last_reco_slug: mem.last_reco_slug,
-      slots: mem.slots ?? {},
-      updated_at: new Date().toISOString(),
-    })
-    .then(
-      () => {},
-      () => {}
-    );
+  if (!sb) return;
+  const payload: any = {
+    session_id: sessionId,
+    last_reco_slug: mem.last_reco_slug,
+    slots: mem.slots ?? {},
+    updated_at: new Date().toISOString(),
+  };
+  if (userId) payload.user_id = userId;
+
+  try {
+    await sb.from("session_memory").upsert(payload);
+  } catch {
+    // retry without user_id if that column doesn't exist
+    delete payload.user_id;
+    try {
+      await sb.from("session_memory").upsert(payload);
+    } catch {}
+  }
 }
 
-// --- follow-up classifier & params ---
+// ---------------------------
+// Conversation logging (best-effort, schema-agnostic)
+// ---------------------------
+type LogRow = {
+  ts: string;
+  session_id: string;
+  user_id?: string | null;
+  role: "user" | "assistant" | "system";
+  content: string;
+  route?: string | null;
+  reco_slug?: string | null;
+  rag_count?: number | null;
+  meta?: any;
+};
+
+async function logMessage(row: LogRow) {
+  if (!sb) return;
+  // try enriched insert
+  try {
+    await sb.from(CONVO_TABLE).insert(row as any);
+    return;
+  } catch {
+    // fall back to minimal columns
+    const minimal = {
+      ts: row.ts,
+      session_id: row.session_id,
+      role: row.role,
+      content: row.content,
+    };
+    try {
+      await sb.from(CONVO_TABLE).insert(minimal as any);
+    } catch {
+      // swallow — logging is best-effort
+    }
+  }
+}
+
+// ---------------------------
+// Follow-up classifier & params
+// ---------------------------
 type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
 function isAffirmativeFollowUp(text: string): boolean {
   return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(
@@ -452,6 +510,12 @@ export const handler: Handler = async (event) => {
       (event.headers["x-session-id"] as string) ||
       (event.headers["X-Session-Id"] as string) ||
       "anon";
+    const userId: string | null =
+      body.userId ||
+      (event.headers["x-user-id"] as string) ||
+      (event.headers["X-User-Id"] as string) ||
+      null;
+
     headers["X-Events-Stage"] = "parsed";
 
     if (!userText) {
@@ -459,7 +523,7 @@ export const handler: Handler = async (event) => {
       return { statusCode: 400, headers, body: "Bad Request: missing user text" };
     }
 
-    const mem = await getSessionMem(sessionId);
+    const mem = await getMem(userId, sessionId);
 
     // ---- DRY MODE ----
     if (mode === "dry") {
@@ -485,7 +549,7 @@ export const handler: Handler = async (event) => {
         bodyText = `${renderPlanForTool(chosen)}\n\n${formatTryLine(chosen)}`;
         recoSlug = chosen.slug || null;
         setCookie(headers, "last_reco_slug", recoSlug || "");
-        await setSessionMem(sessionId, {
+        await setMem(userId, sessionId, {
           last_reco_slug: recoSlug,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: {} } },
         });
@@ -504,26 +568,20 @@ export const handler: Handler = async (event) => {
       headers["X-Reco"] = String(!!recoSlug);
       if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
 
-      if (sb) {
-        void sb
-          .from("events")
-          .insert({
-            ts: new Date().toISOString(),
-            q: userText.slice(0, 500),
-            route,
-            rag_count: 0,
-            rag_mode: null,
-            model: null,
-            reco_slug: recoSlug,
-            duration_ms: Date.now() - t0,
-            ok: true,
-          })
-          .then(
-            () => {},
-            () => {}
-          );
-        headers["X-Events"] = "queued";
-      } else headers["X-Events"] = "no-sb";
+      // best-effort transcript
+      const ts = new Date().toISOString();
+      void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
+      void logMessage({
+        ts,
+        session_id: sessionId,
+        user_id: userId,
+        role: "assistant",
+        content: bodyText.trim(),
+        route,
+        reco_slug: recoSlug,
+        rag_count: 0,
+        meta: { mode: "sim" },
+      });
 
       headers["X-Events-Stage"] = "success";
       headers["X-Duration-Total"] = String(Date.now() - t0);
@@ -534,12 +592,12 @@ export const handler: Handler = async (event) => {
     // ---- Deterministic follow-up layer ----
     const follow = classifyFollowUp(userText);
 
-    // 1) from session memory
+    // 1) from memory (user preferred)
     let proposed =
       (mem.slots && (mem.slots as any).proposed) ||
       (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
 
-    // 2) from last assistant Try: line (requires messages[])
+    // 2) from last assistant Try: (requires messages[])
     if (!proposed) {
       const lastAssistantText =
         [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")
@@ -551,7 +609,7 @@ export const handler: Handler = async (event) => {
       }
     }
 
-    // 3) from cookie
+    // 3) cookie fallback
     if (!proposed) {
       const ck =
         (event.headers["cookie"] as string) ||
@@ -572,16 +630,32 @@ export const handler: Handler = async (event) => {
       if (follow === "accept" && chosen) {
         const params = ((proposed as any).params as PlanParams) || {};
         const finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`;
+
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
         headers["X-Reco-Slug"] = String(chosen.slug || "");
         headers["X-RAG"] = "false";
         headers["X-RAG-Count"] = "0";
+
         setCookie(headers, "last_reco_slug", chosen.slug || "");
-        await setSessionMem(sessionId, {
+        await setMem(userId, sessionId, {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
         });
+
+        const ts = new Date().toISOString();
+        void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
+        void logMessage({
+          ts,
+          session_id: sessionId,
+          user_id: userId,
+          role: "assistant",
+          content: finalText,
+          route: "tools",
+          reco_slug: chosen.slug || null,
+          rag_count: 0,
+        });
+
         headers["X-Events-Stage"] = "success";
         headers["X-Duration-Total"] = String(Date.now() - t0);
         headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
@@ -589,7 +663,7 @@ export const handler: Handler = async (event) => {
       }
 
       if (follow === "reject") {
-        await setSessionMem(sessionId, { last_reco_slug: null, slots: {} });
+        await setMem(userId, sessionId, { last_reco_slug: null, slots: {} });
         // fall through to router
       }
 
@@ -597,16 +671,32 @@ export const handler: Handler = async (event) => {
         const delta = parseRefineParams(userText) || {};
         const merged = mergeParams(((proposed as any).params as PlanParams) || {}, delta);
         const finalText = `${renderPlanForTool(chosen, merged)}\n\n${formatTryLine(chosen)}`;
+
         headers["X-Route"] = "tools";
         headers["X-Reco"] = "true";
         headers["X-Reco-Slug"] = String(chosen.slug || "");
         headers["X-RAG"] = "false";
         headers["X-RAG-Count"] = "0";
+
         setCookie(headers, "last_reco_slug", chosen.slug || "");
-        await setSessionMem(sessionId, {
+        await setMem(userId, sessionId, {
           last_reco_slug: chosen.slug || null,
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: merged } },
         });
+
+        const ts = new Date().toISOString();
+        void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
+        void logMessage({
+          ts,
+          session_id: sessionId,
+          user_id: userId,
+          role: "assistant",
+          content: finalText,
+          route: "tools",
+          reco_slug: chosen.slug || null,
+          rag_count: 0,
+        });
+
         headers["X-Events-Stage"] = "success";
         headers["X-Duration-Total"] = String(Date.now() - t0);
         headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
@@ -622,18 +712,28 @@ export const handler: Handler = async (event) => {
           "",
           `If you want to proceed, say "yes" or refine (e.g., "biweekly via Slack on Fridays at 2pm").`,
         ].join("\n");
-        headers["X-Route"] = "coach"; // informational; not a reco
+
+        headers["X-Route"] = "coach";
         headers["X-Reco"] = "false";
-        await setSessionMem(sessionId, {
+
+        await setMem(userId, sessionId, {
           last_reco_slug: chosen.slug || null,
-          slots: {
-            proposed: {
-              slug: chosen.slug,
-              title: chosen.title,
-              params: ((proposed as any).params as PlanParams) || {},
-            },
-          },
+          slots: { proposed: { slug: chosen.slug, title: chosen.title, params: ((proposed as any).params as PlanParams) || {} } },
         });
+
+        const ts = new Date().toISOString();
+        void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
+        void logMessage({
+          ts,
+          session_id: sessionId,
+          user_id: userId,
+          role: "assistant",
+          content: blurb,
+          route: "coach",
+          reco_slug: null,
+          rag_count: 0,
+        });
+
         headers["X-Events-Stage"] = "success";
         headers["X-Duration-Total"] = String(Date.now() - t0);
         headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
@@ -641,7 +741,7 @@ export const handler: Handler = async (event) => {
       }
 
       if (follow === "compare") {
-        await setSessionMem(sessionId, { last_reco_slug: null, slots: {} });
+        await setMem(userId, sessionId, { last_reco_slug: null, slots: {} });
         // fall through to router
       }
     }
@@ -649,7 +749,7 @@ export const handler: Handler = async (event) => {
     // ---- Router per turn (QA-first) ----
     let decision: any = await pickRoute(userText, clientMessages as any);
 
-    // optional: let LLM scorer weigh in ONLY if not already QA with spans
+    // optional: LLM scorer ONLY if not already QA with spans
     const alreadyQA = decision?.route === "qa" && (decision?.ragMeta?.count ?? 0) > 0;
 
     if (!alreadyQA) {
@@ -688,11 +788,10 @@ export const handler: Handler = async (event) => {
     if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any).impl);
     tAfterRoute = Date.now();
 
-    // ---- Execute chosen path ----
+    // ---- Execute chosen path (+ coach grounding via RAG) ----
     type Span = { title?: string | null; url?: string | null; content: string; score?: number };
 
     function expandForGrounding(q: string): string {
-      // light synonym expansion so embeddings “get” the intent
       return q
         .replace(/\b1[:\- ]?on[:\- ]?1s?\b/gi, "one-on-one meetings")
         .replace(/\b1on1s?\b/gi, "one-on-one meetings")
@@ -712,7 +811,6 @@ export const handler: Handler = async (event) => {
       const qGround = expandForGrounding(userText);
       let g = await retrieveSpans({ q: qGround, topK: 3, minScore: 0.55 });
       if (!g.spans?.length) {
-        // fallback: slightly lower threshold + add hint terms
         g = await retrieveSpans({
           q: `${qGround} agenda cadence expectations`,
           topK: 3,
@@ -739,7 +837,6 @@ export const handler: Handler = async (event) => {
     if (!chosen) chosen = matchToolByIntent(userText, tools);
     if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
 
-    // QA-like phrasing: prefer QA/grounded guidance over enforcing tools
     const qaLike =
       /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
 
@@ -755,37 +852,20 @@ export const handler: Handler = async (event) => {
       recoSlug = chosen.slug || null;
       headers["X-Route"] = "tools";
       setCookie(headers, "last_reco_slug", recoSlug || "");
-      await setSessionMem(sessionId, {
+      await setMem(userId, sessionId, {
         last_reco_slug: chosen.slug || null,
         slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
       });
     } else {
-      // QA: keep the agent’s answer as-is; non-QA: still strip externals
       finalText = isQA
         ? out?.text ?? ""
         : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
     }
     tAfterPolicy = Date.now();
 
-    // preserve agent meta; only inject router RAG for QA
-    const mergedMeta: any = { ...(out?.meta || {}), recoSlug };
-    if (decision?.route === "qa") {
-      mergedMeta.rag = decision?.ragMeta?.count ?? 0;
-      mergedMeta.ragMode = decision?.ragMeta?.mode ?? "raw";
-      mergedMeta.model = decision?.ragMeta?.model ?? mergedMeta.model ?? null;
-    }
-
-    out = {
-      ...(out || { text: "", route: decision.route }),
-      text: finalText,
-      meta: mergedMeta,
-      reco: !!recoSlug,
-    };
-
-    // ---- headers ----
+    // ---- headers (RAG + reco) ----
     if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
 
-    // router spans + (coach grounding only)
     const ragFromRouter = Number(decision?.ragMeta?.count ?? 0);
     const ragFromAgent = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? 0);
     const totalRagCount = ragFromRouter + ragFromAgent;
@@ -794,14 +874,34 @@ export const handler: Handler = async (event) => {
     headers["X-RAG-Count"] = String(totalRagCount);
     headers["X-Coach-RAG-Count"] = String(ragFromAgent);
 
-    // Prefer router’s mode/model; fall back to agent’s (coach grounding)
     const ragMode = decision?.ragMeta?.mode ?? (out as any)?.meta?.ragMode ?? null;
     const embedModel = decision?.ragMeta?.model ?? (out as any)?.meta?.model ?? null;
     if (ragMode) headers["X-RAG-Mode"] = String(ragMode);
     if (embedModel) headers["X-Embed-Model"] = String(embedModel);
 
-    headers["X-Reco"] = String(!!out?.reco);
-    if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
+    headers["X-Reco"] = String(!!recoSlug);
+    if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
+
+    // ---- Log transcript (user + assistant) ----
+    const ts = new Date().toISOString();
+    void logMessage({
+      ts,
+      session_id: sessionId,
+      user_id: userId,
+      role: "user",
+      content: userText,
+    });
+    void logMessage({
+      ts,
+      session_id: sessionId,
+      user_id: userId,
+      role: "assistant",
+      content: finalText,
+      route: headers["X-Route"] || decision.route,
+      reco_slug: recoSlug,
+      rag_count: totalRagCount,
+      meta: { coach_grounded: coachGround?.length || 0 },
+    });
 
     // ---- telemetry (fire-and-forget) ----
     const duration = Date.now() - t0;
@@ -810,13 +910,13 @@ export const handler: Handler = async (event) => {
       void sb
         .from("events")
         .insert({
-          ts: new Date().toISOString(),
+          ts: ts,
           q: userText.slice(0, 500),
-          route: headers["X-Route"] || out?.route || decision.route,
+          route: headers["X-Route"] || decision.route,
           rag_count: totalRagCount,
           rag_mode: ragMode,
           model: embedModel,
-          reco_slug: out?.meta?.recoSlug ?? null,
+          reco_slug: recoSlug,
           duration_ms: duration,
           ok: true,
         })
@@ -841,7 +941,7 @@ export const handler: Handler = async (event) => {
       `total;dur=${tEnd - t0}`,
     ].join(", ");
 
-    return { statusCode: 200, headers, body: out?.text || "" };
+    return { statusCode: 200, headers, body: finalText };
   } catch (err: any) {
     const duration = Date.now() - t0;
     headers["X-Duration-Total"] = String(duration);
