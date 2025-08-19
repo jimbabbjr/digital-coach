@@ -129,6 +129,7 @@ export function matchToolByIntent(userText: string, tools: ToolDoc[]): ToolDoc |
     }
   }
   if (pick && best >=2) return pick;
+  return null;
 }
 
 export function formatTryLine(t: ToolDoc) {

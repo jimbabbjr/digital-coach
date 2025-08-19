@@ -59,7 +59,7 @@ export async function scoreRouteLLM(params: {
   if (!apiKey) return null;
 if (isMediaAsk(userText)) {
   // Force a non-tools route so we don't hijack with Weekly Report, etc.
-  return { route: "qa" as const };
+  return { route: "recs" as const };
 }
   const client = new OpenAI({ apiKey: apiKey! });
 
