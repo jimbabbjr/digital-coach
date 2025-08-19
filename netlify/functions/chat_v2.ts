@@ -5,10 +5,13 @@ import { createClient } from "@supabase/supabase-js";
 import { route as pickRoute } from "./lib/agents/router";
 import { QaAgent } from "./lib/agents/qa";
 import { CoachAgent } from "./lib/agents/coach";
-// If you ever want to short-circuit tools turns, you can import ToolsAgent and swap it in.
-// import { ToolsAgent } from "./lib/agents/tools";
+// import { ToolsAgent } from "./lib/agents/tools"; // optional fast path
 
-import { buildAllowlist, stripAllTryLines, removeExternalToolMentions } from "./lib/sanitize";
+import {
+  buildAllowlist,
+  stripAllTryLines,
+  removeExternalToolMentions,
+} from "./lib/sanitize";
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 import { retrieveSpans } from "./lib/retrieve";
 
@@ -17,7 +20,10 @@ import { retrieveSpans } from "./lib/retrieve";
 // ---------------------------
 const sb =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+    ? createClient(
+        process.env.SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!
+      )
     : null;
 
 // ---------------------------
@@ -36,12 +42,17 @@ function formatTryLine(t: { title: string }) {
   return `Try: ${t.title}`;
 }
 
-function renderPlanForTool(tool: { title: string; outcome?: string | null }, p: PlanParams = {}) {
+function renderPlanForTool(
+  tool: { title: string; outcome?: string | null },
+  p: PlanParams = {}
+) {
   const outcome = tool.outcome || "reliable weekly signal without manual chasing";
   const cadence = p.cadence || "weekly";
   const day = p.due_day || (cadence === "weekly" ? "Friday" : undefined);
   const time = p.due_time || "3pm";
-  const channel = p.channel ? p.channel.charAt(0).toUpperCase() + p.channel.slice(1) : "App";
+  const channel = p.channel
+    ? p.channel.charAt(0).toUpperCase() + p.channel.slice(1)
+    : "App";
   const rem = typeof p.reminders === "number" ? p.reminders : 1;
   const anon = p.anonymous ? " (anonymous collection enabled)" : "";
 
@@ -94,16 +105,24 @@ function toList(x: unknown): string[] {
   return s.split(",").map((v) => v.trim()).filter(Boolean);
 }
 function kebab(s?: string | null) {
-  return String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 function coalesce<T>(...vals: T[]): T | undefined {
-  for (const v of vals) if (v !== undefined && v !== null && String(v) !== "") return v;
+  for (const v of vals)
+    if (v !== undefined && v !== null && String(v) !== "") return v;
   return undefined;
 }
 function isEnabledRow(row: any): boolean {
-  const v = row?.enabled ?? row?.is_enabled ?? row?.active ?? row?.is_active ?? row?.status;
+  const v =
+    row?.enabled ?? row?.is_enabled ?? row?.active ?? row?.is_active ?? row?.status;
   if (typeof v === "boolean") return v;
-  if (typeof v === "string") return ["1", "true", "t", "y", "yes", "active", "enabled"].includes(v.toLowerCase());
+  if (typeof v === "string")
+    return ["1", "true", "t", "y", "yes", "active", "enabled"].includes(
+      v.toLowerCase()
+    );
   if (typeof v === "number") return v > 0;
   return true;
 }
@@ -140,8 +159,12 @@ type ToolRow = {
 function normalizeToolRow(row: any): ToolRow | null {
   if (!row) return null;
 
-  const title = (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) || "";
-  const slug = (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) || "";
+  const title =
+    (coalesce<string>(row.title, row.tool_name, row.name, row.display_name) as string) ||
+    "";
+  const slug =
+    (coalesce<string>(row.slug, row.tool_slug, row.code, kebab(title)) as string) ||
+    "";
   if (!title || !slug) return null;
 
   const summary = coalesce<string>(row.summary, row.primary_use, row.description) ?? null;
@@ -215,7 +238,9 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     }
 
     // keywords
-    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) => s.toLowerCase());
+    const kws = (Array.isArray(t.keywords) ? t.keywords : toList(t.keywords)).map((s) =>
+      s.toLowerCase()
+    );
     let kwHits = 0;
     for (const k of kws) if (k && lower.includes(k)) kwHits++;
 
@@ -227,7 +252,8 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     const lex = B.size ? overlap / Math.max(A.size, B.size) : 0;
 
     let score = patternHits * 2 + kwHits + lex * 3;
-    if (hasWeeklyReport && /\bweekly\b.*\b(report|updates?)\b/.test(title.toLowerCase())) score += 3;
+    if (hasWeeklyReport && /\bweekly\b.*\b(report|updates?)\b/.test(title.toLowerCase()))
+      score += 3;
 
     if (!best || score > best.score) best = { tool: t, score };
   }
@@ -235,7 +261,10 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
   return best.tool;
 }
 
-function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolRow | null {
+function detectToolFromAssistant(
+  assistantText: string,
+  tools: ToolRow[]
+): ToolRow | null {
   if (!assistantText) return null;
   const m = assistantText.match(/^\s*Try\s*:\s*(.+)$/im);
   const candidate = m?.[1]?.trim();
@@ -243,7 +272,8 @@ function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolR
 
   let best: { tool: ToolRow; score: number } | null = null;
   for (const t of tools) {
-    const s = norm(t.title) === norm(candidate) ? 1 : tokenOverlap(t.title, candidate);
+    const s =
+      norm(t.title) === norm(candidate) ? 1 : tokenOverlap(t.title, candidate);
     if (!best || s > best.score) best = { tool: t, score: s };
   }
   if (best && best.score >= 0.7) return best.tool;
@@ -252,15 +282,22 @@ function detectToolFromAssistant(assistantText: string, tools: ToolRow[]): ToolR
 
 // --- session memory helpers (optional; SERVICE_ROLE only) ---
 async function getSessionMem(sessionId: string) {
-  if (!sb || !sessionId) return { last_reco_slug: null as string | null, slots: {} as any };
+  if (!sb || !sessionId)
+    return { last_reco_slug: null as string | null, slots: {} as any };
   const { data } = await sb
     .from("session_memory")
     .select("last_reco_slug, slots")
     .eq("session_id", sessionId)
     .maybeSingle();
-  return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
+  return {
+    last_reco_slug: (data as any)?.last_reco_slug ?? null,
+    slots: (data as any)?.slots ?? {},
+  };
 }
-async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | null; slots?: any }) {
+async function setSessionMem(
+  sessionId: string,
+  mem: { last_reco_slug: string | null; slots?: any }
+) {
   if (!sb || !sessionId) return;
   void sb
     .from("session_memory")
@@ -279,15 +316,23 @@ async function setSessionMem(sessionId: string, mem: { last_reco_slug: string | 
 // --- follow-up classifier & params ---
 type FollowKind = "accept" | "reject" | "refine" | "askinfo" | "compare" | "none";
 function isAffirmativeFollowUp(text: string): boolean {
-  return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(text);
+  return /\b(yes|yep|yeah|do it|sounds good|let'?s (go|do it)|please|ok|okay|go ahead|run it|ship it)\b/i.test(
+    text
+  );
 }
 function isNegativeFollowUp(text: string): boolean {
-  return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(text);
+  return /\b(no|nah|not now|pass|skip|don'?t|another way|different approach|prefer not)\b/i.test(
+    text
+  );
 }
 function isInfoFollowUp(text: string): boolean {
   return (
-    /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(text) ||
-    /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(text) ||
+    /\b(what\s+(is|does)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s*(do)?)\b/i.test(
+      text
+    ) ||
+    /\b(how\s+(does|would)\s+(it|this(\s+tool)?|that(\s+tool)?|this|that)\s+work)\b/i.test(
+      text
+    ) ||
     /\b(explain|more\s+detail|tell\s+me\s+more|why)\b/i.test(text)
   );
 }
@@ -382,7 +427,12 @@ export const handler: Handler = async (event) => {
         text: string;
         route: "qa" | "coach" | "tools" | string;
         reco?: boolean;
-        meta?: { rag?: number; ragMode?: string | null; model?: string | null; recoSlug?: string | null };
+        meta?: {
+          rag?: number;
+          ragMode?: string | null;
+          model?: string | null;
+          recoSlug?: string | null;
+        };
       }
     | null = null;
 
@@ -392,8 +442,9 @@ export const handler: Handler = async (event) => {
     const clientMessages = Array.isArray(body?.messages) ? body.messages : [];
     userText =
       body?.q ??
-      [...clientMessages].reverse().find((m: any) => m?.role === "user" && typeof m?.content === "string")
-        ?.content ??
+      [...clientMessages].reverse().find(
+        (m: any) => m?.role === "user" && typeof m?.content === "string"
+      )?.content ??
       "";
     userText = String(userText).trim();
     const sessionId: string =
@@ -491,7 +542,8 @@ export const handler: Handler = async (event) => {
     // 2) from last assistant Try: line (requires messages[])
     if (!proposed) {
       const lastAssistantText =
-        [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")?.content || "";
+        [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")
+          ?.content || "";
       if (lastAssistantText) {
         const toolsForDetect = await getToolRegistryCached();
         const det = detectToolFromAssistant(lastAssistantText, toolsForDetect);
@@ -501,7 +553,10 @@ export const handler: Handler = async (event) => {
 
     // 3) from cookie
     if (!proposed) {
-      const ck = (event.headers["cookie"] as string) || (event.headers["Cookie"] as string) || "";
+      const ck =
+        (event.headers["cookie"] as string) ||
+        (event.headers["Cookie"] as string) ||
+        "";
       const slugFromCookie = getCookie("last_reco_slug", ck);
       if (slugFromCookie) proposed = { slug: slugFromCookie };
     }
@@ -601,7 +656,9 @@ export const handler: Handler = async (event) => {
       try {
         const tools = await getToolRegistryCached();
         headers["X-Tools-Len"] = String(tools.length);
-        const candidates = getCandidatesFromTools ? getCandidatesFromTools(tools as any, userText, 6) : [];
+        const candidates = getCandidatesFromTools
+          ? getCandidatesFromTools(tools as any, userText, 6)
+          : [];
         const scored = await scoreRouteLLM({
           apiKey: process.env.OPENAI_API_KEY,
           model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
@@ -637,7 +694,8 @@ export const handler: Handler = async (event) => {
     function expandForGrounding(q: string): string {
       // light synonym expansion so embeddings “get” the intent
       return q
-        .replace(/\b1[:\-]1s?\b/gi, "one-on-one meetings")
+        .replace(/\b1[:\- ]?on[:\- ]?1s?\b/gi, "one-on-one meetings")
+        .replace(/\b1on1s?\b/gi, "one-on-one meetings")
         .replace(/\bone on ones?\b/gi, "one-on-one meetings")
         .replace(/\bone to ones?\b/gi, "one-on-one meetings");
     }
@@ -645,12 +703,28 @@ export const handler: Handler = async (event) => {
     let coachGround: Span[] = [];
 
     if (decision.route === "qa") {
-      out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
+      out = await QaAgent.handle({
+        userText,
+        messages: clientMessages,
+        ragSpans: decision.ragSpans,
+      });
     } else {
       const qGround = expandForGrounding(userText);
-      const g = await retrieveSpans({ q: qGround, topK: 3, minScore: 0.55 });
-      coachGround = g.spans;
-      out = await CoachAgent.handle({ userText, messages: clientMessages, grounding: coachGround });
+      let g = await retrieveSpans({ q: qGround, topK: 3, minScore: 0.55 });
+      if (!g.spans?.length) {
+        // fallback: slightly lower threshold + add hint terms
+        g = await retrieveSpans({
+          q: `${qGround} agenda cadence expectations`,
+          topK: 3,
+          minScore: 0.45,
+        });
+      }
+      coachGround = g.spans || [];
+      out = await CoachAgent.handle({
+        userText,
+        messages: clientMessages,
+        grounding: coachGround,
+      });
     }
     tAfterAgent = Date.now();
 
@@ -660,9 +734,14 @@ export const handler: Handler = async (event) => {
     const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
 
     let chosen: ToolRow | null = null;
-    if (decision?.best_tool_slug) chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
+    if (decision?.best_tool_slug)
+      chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
     if (!chosen) chosen = matchToolByIntent(userText, tools);
     if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
+
+    // QA-like phrasing: prefer QA/grounded guidance over enforcing tools
+    const qaLike =
+      /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
 
     let finalText: string;
     let recoSlug: string | null = null;
@@ -670,7 +749,7 @@ export const handler: Handler = async (event) => {
     // treat any routed QA with nonzero spans as QA; don't enforce tools on it
     const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
 
-    if (!isQA && chosen) {
+    if (!isQA && !qaLike && chosen) {
       const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
       finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
       recoSlug = chosen.slug || null;
@@ -682,7 +761,9 @@ export const handler: Handler = async (event) => {
       });
     } else {
       // QA: keep the agent’s answer as-is; non-QA: still strip externals
-      finalText = isQA ? out?.text ?? "" : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
+      finalText = isQA
+        ? out?.text ?? ""
+        : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
     }
     tAfterPolicy = Date.now();
 
@@ -750,13 +831,14 @@ export const handler: Handler = async (event) => {
     headers["X-Events-Stage"] = "success";
 
     // ---- server-timing ----
-    tAfterTelemetry = Date.now();
+    const tEnd = Date.now();
+    tAfterTelemetry = tEnd;
     headers["Server-Timing"] = [
       `route;dur=${tAfterRoute - t0}`,
       `agent;dur=${tAfterAgent - tAfterRoute}`,
       `policy;dur=${tAfterPolicy - tAfterAgent}`,
       `telemetry;dur=${tAfterTelemetry - tAfterPolicy}`,
-      `total;dur=${Date.now() - t0}`,
+      `total;dur=${tEnd - t0}`,
     ].join(", ");
 
     return { statusCode: 200, headers, body: out?.text || "" };
@@ -790,9 +872,9 @@ export const handler: Handler = async (event) => {
 
     headers["X-Events-Stage"] = "error";
     headers["Server-Timing"] = [
-      `route;dur=${Math.max(0, tAfterRoute - t0)}`,
-      `agent;dur=${tAfterAgent && tAfterRoute ? tAfterAgent - tAfterRoute : 0}`,
-      `policy;dur=${tAfterPolicy && tAfterAgent ? tAfterPolicy - tAfterAgent : 0}`,
+      `route;dur=${Math.max(0, 0)}`,
+      `agent;dur=0`,
+      `policy;dur=0`,
       `telemetry;dur=${Date.now() - (tAfterPolicy || t0)}`,
       `total;dur=${Date.now() - t0}`,
     ].join(", ");
