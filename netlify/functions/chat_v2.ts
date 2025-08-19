@@ -772,6 +772,7 @@ if (!isQA && !qaLike && chosen) {
   finalText = isQA
     ? renumberOrderedLists(out?.text ?? "")
     : sanitizeNeutralGuidance(out?.text ?? "", allow);
+    finalText = renumberOrderedLists(finalText); 
 }
     tAfterPolicy = Date.now();
 
