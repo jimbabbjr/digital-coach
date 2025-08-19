@@ -351,7 +351,7 @@ export const handler: Handler = async (event) => {
   const headers: Record<string, string> = {
     "Content-Type": "text/plain; charset=utf-8",
     "Access-Control-Expose-Headers":
-      "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing, X-Tools-Len",
+  "X-Route, X-RAG, X-RAG-Count, X-RAG-Mode, X-Embed-Model, X-Model, X-Reco, X-Reco-Slug, X-Duration-Total, X-Events, X-Events-Err, X-Events-Msg, X-Events-Stage, X-Policy-Version, X-Debug-Stamp, Server-Timing, X-Tools-Len, X-Route-Router, X-Router-Impl",
     "X-Policy-Version": POLICY_VERSION,
     "X-Debug-Stamp": DEBUG_STAMP,
   };
@@ -612,6 +612,9 @@ export const handler: Handler = async (event) => {
       }
     } catch {}
     if (!decision) decision = await pickRoute(userText, clientMessages as any);
+    // --- debug: what the router decided ---
+headers["X-Route-Router"] = String(decision?.route || "");
+if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any).impl);
     tAfterRoute = Date.now();
 
     // ---- Execute chosen path ----
