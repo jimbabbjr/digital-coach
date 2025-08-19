@@ -7,17 +7,20 @@ export type Decision = {
   ragSpans: { content: string }[];
   ragMeta: { count: number; mode: string | null; model: string | null };
   best_tool_slug?: string | null;
-  // debug marker so chat_v2 can expose which router impl ran
-  impl?: string;
+  impl?: string; // debug marker so chat_v2 can expose which router impl ran
 };
 
-// QA-first router: try retrieval when question looks doc/policy-ish.
-// If nothing retrieved, fall back to LLM router. Else default=coach.
+/**
+ * QA-first router:
+ * 1) If the text smells like docs/policy, try retrieval with a lenient floor.
+ * 2) If nothing retrieved, ask the LLM scorer (tools vs coach).
+ * 3) Default = coach.
+ */
 export async function route(userText: string, messages: any[]): Promise<Decision> {
   const q = String(userText || "");
   const ql = q.toLowerCase();
 
-  // 1) Cheap QA hint → try RAG immediately with a lenient floor for small corpora
+  // 1) Cheap QA hint → try RAG immediately (lenient floor for small corpora)
   const qaHint =
     /\b(where|link|docs?|document(ed|ation)?|policy|wiki|confluence|notion)\b/.test(ql) ||
     /\b(find|show)\b.*\b(doc|policy|guid(e|eline)s?)\b/.test(ql);
@@ -45,10 +48,11 @@ export async function route(userText: string, messages: any[]): Promise<Decision
       candidates,
       lastRecoSlug: null,
     });
+
     if (scored) {
       return {
         impl: "qa-first-v2",
-        route: scored.route as Decision["route"],
+        route: (scored.route as Decision["route"]) ?? "coach",
         ragSpans: [],
         ragMeta: { count: 0, mode: null, model: null },
         best_tool_slug: scored.best_tool_slug || null,

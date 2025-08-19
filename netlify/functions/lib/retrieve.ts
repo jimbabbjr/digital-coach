@@ -10,7 +10,7 @@ const sb =
     ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     : null;
 
-export async function retrieveSpans(opts: { q: string; topK?: number; minScore?: number }): Promise<{spans: Span[]; meta: Meta}> {
+export async function retrieveSpans(opts: { q: string; topK?: number; minScore?: number }): Promise<{ spans: Span[]; meta: Meta }> {
   const q = (opts.q || "").slice(0, 4000);
   if (!q || !sb) return { spans: [], meta: { model: null, count: 0 } };
 
@@ -32,9 +32,14 @@ export async function retrieveSpans(opts: { q: string; topK?: number; minScore?:
     url: r.url ?? null,
     content: r.content,
     score: typeof r.similarity === "number" ? r.similarity : 0,
-  }));
+  })).sort((a,b) => b.score - a.score);
 
-  const minScore = opts.minScore ?? 0.72;
-  const filtered = spans.filter((s) => s.score >= minScore);
+  // Adaptive filter: default 0.55; if nothing passes but top is close, allow top-1
+  const floor = opts.minScore ?? 0.55;
+  let filtered = spans.filter((s) => s.score >= floor);
+  if (!filtered.length && spans.length && spans[0].score >= Math.max(0.35, floor - 0.20)) {
+    filtered = [spans[0]];
+  }
+
   return { spans: filtered, meta: { model: embedModel, count: filtered.length } };
 }
