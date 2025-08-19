@@ -1,61 +1,89 @@
 // netlify/functions/lib/agents/coach.ts
 import OpenAI from "openai";
-// If you have a shared Msg type, you can import it. Otherwise this local type is fine.
-type Msg = { role: "user" | "assistant" | "system"; content: string };
 
-const oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+type Span = { title?: string | null; url?: string | null; content: string; score?: number };
 
-const SYSTEM = `You are a sharp, practical coach. Be concise, actionable, and upbeat.
-- Focus on the user's goals, constraints, and next best step.
-- Prefer checklists, short templates, and concrete examples over theory.
-- Avoid brand or third-party tool endorsements unless the user asks.
-- Keep replies scannable with short sections or bullets.
-`;
+type HandleArgs = {
+  userText: string;
+  messages: any[];
+  grounding?: Span[];             // <= RAG snippets for coach turns
+};
 
-// We intentionally do NOT annotate with a custom Agent interface,
-// because your current Agent type doesn’t include `route`.
+function trimBlock(s: string, max = 1200): string {
+  s = String(s || "");
+  if (s.length <= max) return s;
+  return s.slice(0, max) + " …";
+}
+
 export const CoachAgent = {
-  route: "coach" as const,
+  async handle({ userText, grounding = [] }: HandleArgs): Promise<{
+    text: string;
+    route: "coach";
+    meta: { rag?: number; ragMode?: string | null; model?: string | null };
+  }> {
+    const model = process.env.OPENAI_API_KEY ? (process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini") : null;
 
-  async handle({
-    userText,
-    messages,
-  }: {
-    userText: string;
-    messages: Msg[];
-  }) {
-    // Build a clean message list for Chat Completions
-    const chatMessages: Msg[] = [
-      { role: "system", content: SYSTEM },
-      ...messages
-        .filter((m) => m && typeof m.content === "string")
-        .map((m) => ({
-          role: (m.role === "user" || m.role === "assistant" || m.role === "system"
-            ? m.role
-            : "user") as Msg["role"],
-          content: String(m.content),
-        })),
-      { role: "user", content: String(userText) },
-    ];
+    // Build a compact CONTEXT block from spans (titles help anchor the principles)
+    const ctx = grounding.slice(0, 3).map((s, i) => {
+      const head =
+        (s.title ? `#${i + 1} ${s.title}` : `#${i + 1} Principle`) +
+        (s.url ? `  (${s.url})` : "");
+      return `${head}\n${trimBlock(s.content || "", 900)}`;
+    }).join("\n\n---\n\n");
 
-    const model = process.env.OPENAI_COACH_MODEL || "gpt-4o-mini";
+    const contextNote = ctx
+      ? `Use ONLY the following internal context to ground your advice.\n\n${ctx}`
+      : `There is no additional context; use generic leadership/ops best practices.`;
 
-    const completion = await oai.chat.completions.create({
+    // If no API key, return a deterministic, grounded-ish template
+    if (!model) {
+      const groundedBits = grounding.length
+        ? `\n\n_Grounded in:_ ${(grounding[0].title || "internal principles")}`
+        : "";
+      const text =
+        `Here’s a concise plan:\n\n` +
+        `1) Clarify the outcome and constraints.\n` +
+        `2) Identify blockers and decide the next step.\n` +
+        `3) Communicate expectations and cadence.\n` +
+        `4) Close the loop and inspect results.${groundedBits}`;
+      return { text, route: "coach", meta: { rag: grounding.length, ragMode: "coach-ground", model: null } };
+    }
+
+    // LLM prompt (action-oriented + grounded)
+    const system =
+      [
+        "You are an action-oriented leadership/ops coach.",
+        "Root your guidance in the CONTEXT block I provide.",
+        "Do not mention external brands or tools.",
+        "Format:",
+        "- Brief direction (2–3 sentences).",
+        "- A numbered action plan (4–6 steps, imperative).",
+        "- A tiny 'Grounded in' section listing 1–2 principle titles.",
+      ].join("\n");
+
+    const user =
+      [
+        `Question: ${userText}`,
+        "",
+        "CONTEXT:",
+        contextNote,
+      ].join("\n");
+
+    const oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    const resp = await oai.chat.completions.create({
       model,
-      messages: chatMessages,
       temperature: 0.3,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
 
-    const text =
-      completion.choices?.[0]?.message?.content?.trim() ??
-      "Okay! What would you like coaching on today?";
-
+    const answer = resp.choices[0]?.message?.content?.trim() || "Here’s a concise plan.";
     return {
-      text,
-      route: "coach" as const,
-      meta: { model },
+      text: answer,
+      route: "coach",
+      meta: { rag: grounding.length, ragMode: "coach-ground", model },
     };
   },
 };
-
-export type CoachAgentType = typeof CoachAgent;

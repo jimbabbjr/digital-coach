@@ -10,6 +10,7 @@ import { CoachAgent } from "./lib/agents/coach";
 
 import { buildAllowlist, stripAllTryLines, removeExternalToolMentions } from "./lib/sanitize";
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
+import { retrieveSpans } from "./lib/retrieve";
 
 // ---------------------------
 // Supabase (optional; telemetry & registry & session memory)
@@ -623,15 +624,17 @@ if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any)
     tAfterRoute = Date.now();
 
     // ---- Execute chosen path ----
-    if (decision.route === "qa") {
-      out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
-    } else {
-      // Even when router leans "tools", we let Coach craft guidance; policy enforces the tool plan after.
-      out = await CoachAgent.handle({ userText, messages: clientMessages });
-      // If later you want speed on obvious tools, swap:
-      // if (decision.route === "tools") out = await ToolsAgent.handle({ userText, messages: clientMessages });
-    }
-    tAfterAgent = Date.now();
+let coachGround: { title?: string|null; url?: string|null; content: string; score?: number }[] = [];
+
+if (decision.route === "qa") {
+  out = await QaAgent.handle({ userText, messages: clientMessages, ragSpans: decision.ragSpans });
+} else {
+  // Fast retrieval to ground coach answers in internal principles
+  const g = await retrieveSpans({ q: userText, topK: 3, minScore: 0.55 });
+  coachGround = g.spans;
+  out = await CoachAgent.handle({ userText, messages: clientMessages, grounding: coachGround });
+}
+tAfterAgent = Date.now();
 
     // ---- Policy: enforce internal tool if matched; else strip externals ----
     const tools = await getToolRegistryCached();
@@ -679,13 +682,24 @@ if (!isQA && chosen) {
     };
 
     // ---- headers ----
-    if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
-    headers["X-RAG"] = String(!!(decision?.ragMeta?.count ?? 0));
-    headers["X-RAG-Count"] = String(decision?.ragMeta?.count ?? 0);
-    if (decision?.ragMeta?.mode) headers["X-RAG-Mode"] = String(decision.ragMeta.mode);
-    if (decision?.ragMeta?.model) headers["X-Embed-Model"] = String(decision.ragMeta.model);
-    headers["X-Reco"] = String(!!out?.reco);
-    if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
+if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
+
+// RAG: router spans + (coach grounding only)
+const ragFromRouter = Number(decision?.ragMeta?.count ?? 0);
+const ragFromAgent  = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? 0);
+const totalRagCount = ragFromRouter + ragFromAgent;
+
+headers["X-RAG"]       = String(totalRagCount > 0);
+headers["X-RAG-Count"] = String(totalRagCount);
+
+// Prefer router’s mode/model; fall back to agent meta (coach grounding)
+const ragMode   = decision?.ragMeta?.mode  ?? (out as any)?.meta?.ragMode ?? null;
+const embedModel= decision?.ragMeta?.model ?? (out as any)?.meta?.model   ?? null;
+if (ragMode)    headers["X-RAG-Mode"]    = String(ragMode);
+if (embedModel) headers["X-Embed-Model"] = String(embedModel);
+
+headers["X-Reco"] = String(!!out?.reco);
+if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
 
     // ---- telemetry (fire-and-forget) ----
     const duration = Date.now() - t0;
