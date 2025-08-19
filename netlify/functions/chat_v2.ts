@@ -9,14 +9,13 @@ import { CoachAgent } from "./lib/agents/coach";
 
 import {
   buildAllowlist,
+  stripAllTryLines,
+  removeExternalToolMentions,
   renumberOrderedLists,
-  sanitizeNeutralGuidance,
 } from "./lib/sanitize";
 
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 import { retrieveSpans } from "./lib/retrieve";
-import { appendTurnToDebugLogs } from "./lib/debug_logs";
-import crypto from "node:crypto";
 
 // ---------------------------
 // Supabase (telemetry, registry, memory, transcripts)
@@ -26,15 +25,16 @@ const sb =
     ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     : null;
 
-const CONVO_TABLE = process.env.CONVO_TABLE || "public.debug_logs";
+// Debug logs table (existing in your project)
+const DEBUGLOGS_TABLE = "debug_logs";
 
 // ---------------------------
 // Types & helpers
 // ---------------------------
 type PlanParams = {
   cadence?: "weekly" | "biweekly" | "monthly" | "daily";
-  due_day?: string; // e.g., "Friday"
-  due_time?: string; // e.g., "3pm"
+  due_day?: string;   // e.g., "Friday"
+  due_time?: string;  // e.g., "3pm"
   channel?: "slack" | "email" | "app";
   anonymous?: boolean;
   reminders?: 0 | 1 | 2;
@@ -74,7 +74,11 @@ function renderPlanForTool(tool: { title: string; outcome?: string | null }, p: 
 
 // --- text utils ---
 function norm(s: string) {
-  return String(s || "").toLowerCase().replace(/\btool\b/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\btool\b/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 function tokenOverlap(a: string, b: string): number {
   const A = new Set(norm(a).split(" ").filter(Boolean));
@@ -89,11 +93,7 @@ function toList(x: unknown): string[] {
   if (x == null) return [];
   const s = String(x);
   if (s.startsWith("{") && s.endsWith("}")) {
-    return s
-      .slice(1, -1)
-      .split(",")
-      .map((v) => v.trim())
-      .filter(Boolean);
+    return s.slice(1, -1).split(",").map((v) => v.trim()).filter(Boolean);
   }
   return s.split(",").map((v) => v.trim()).filter(Boolean);
 }
@@ -213,9 +213,7 @@ function matchToolByIntent(userText: string, tools: ToolRow[]): ToolRow | null {
     const rawPatterns = Array.isArray(t.patterns) ? t.patterns : toList(t.patterns);
     let patternHits = 0;
     for (const rx of rawPatterns) {
-      try {
-        if (new RegExp(rx, "i").test(text)) patternHits++;
-      } catch {}
+      try { if (new RegExp(rx, "i").test(text)) patternHits++; } catch {}
     }
 
     // keywords
@@ -261,6 +259,7 @@ type MemRow = { last_reco_slug: string | null; slots: any };
 
 async function getMem(userId: string | null, sessionId: string): Promise<MemRow> {
   if (!sb) return { last_reco_slug: null, slots: {} };
+  // try user-level first (if provided)
   if (userId) {
     const { data } = await sb
       .from("session_memory")
@@ -269,6 +268,7 @@ async function getMem(userId: string | null, sessionId: string): Promise<MemRow>
       .maybeSingle();
     if (data) return { last_reco_slug: (data as any).last_reco_slug ?? null, slots: (data as any).slots ?? {} };
   }
+  // fallback to session-level
   const { data } = await sb
     .from("session_memory")
     .select("last_reco_slug, slots")
@@ -277,7 +277,11 @@ async function getMem(userId: string | null, sessionId: string): Promise<MemRow>
   return { last_reco_slug: (data as any)?.last_reco_slug ?? null, slots: (data as any)?.slots ?? {} };
 }
 
-async function setMem(userId: string | null, sessionId: string, mem: { last_reco_slug: string | null; slots?: any }) {
+async function setMem(
+  userId: string | null,
+  sessionId: string,
+  mem: { last_reco_slug: string | null; slots?: any }
+) {
   if (!sb) return;
   const payload: any = {
     session_id: sessionId,
@@ -290,124 +294,78 @@ async function setMem(userId: string | null, sessionId: string, mem: { last_reco
   try {
     await sb.from("session_memory").upsert(payload);
   } catch {
-    delete payload.user_id;
-    try {
-      await sb.from("session_memory").upsert(payload);
-    } catch {}
+    // retry without user_id if that column doesn't exist
+    delete (payload as any).user_id;
+    try { await sb.from("session_memory").upsert(payload); } catch {}
   }
 }
 
 // ---------------------------
+// Debug logs (single row per conversation; upsert by conversation_id)
 // ---------------------------
-// Conversation logging (schema-aware; appends to public.debug_logs if selected)
-// ---------------------------
-type LogRow = {
-  ts: string;
-  session_id: string;
-  user_id?: string | null;
-  role: "user" | "assistant" | "system";
-  content: string;
-  route?: string | null;
-  reco_slug?: string | null;
-  rag_count?: number | null;
-  meta?: any;
-  // Optional: if you can pass a real UUID from the client, we’ll use it
-  conversation_id?: string | null;
-};
+type SimpleMsg = { role: "user" | "assistant" | "system"; content: string };
 
-function isUuid(v?: string | null) {
-  return !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-}
-
-function uuidFromString(s: string) {
-  // deterministic UUID-ish from a string (v4/v5 style—valid format for UUID column)
-  const h = crypto.createHash("sha1").update(s).digest("hex");
-  // enforce RFC4122 bits (version 4, variant 10)
-  return `${h.slice(0,8)}-${h.slice(8,12)}-4${h.slice(13,16)}-a${h.slice(17,20)}-${h.slice(20,32)}`;
-}
-
-async function logMessage(row: LogRow) {
+async function upsertDebugLog(params: {
+  sessionId: string;
+  userId?: string | null;
+  userText: string;
+  assistantText: string;
+  route: string;
+  recoSlug?: string | null;
+  ragCount?: number | null;
+  extraMeta?: Record<string, any>;
+}) {
   if (!sb) return;
+  const {
+    sessionId,
+    userId = null,
+    userText,
+    assistantText,
+    route,
+    recoSlug = null,
+    ragCount = null,
+    extraMeta = {},
+  } = params;
 
-  // If we're targeting public.debug_logs, we need to APPEND the message to conversation_history
-  const isDebugLogs = /(^|\.)(debug_logs)$/i.test(CONVO_TABLE);
+  // Load existing transcript so we append instead of overwrite
+  const { data: existing } = await sb
+    .from(DEBUGLOGS_TABLE)
+    .select("conversation_history")
+    .eq("conversation_id", sessionId)
+    .maybeSingle();
 
-  if (isDebugLogs) {
-    const convId =
-      (row.conversation_id && isUuid(row.conversation_id) && row.conversation_id) ||
-      (isUuid(row.session_id) ? row.session_id : uuidFromString(row.session_id || (row.user_id || "anon")));
+  const history: SimpleMsg[] = Array.isArray((existing as any)?.conversation_history)
+    ? (existing as any).conversation_history
+    : [];
 
-    // Fetch existing row for this conversation
-    let existing: any = null;
-    try {
-      const { data } = await sb
-        .from(CONVO_TABLE)
-        .select("id, conversation_history")
-        .eq("label", "conversation")
-        .eq("conversation_id", convId)
-        .limit(1)
-        .maybeSingle();
+  if (userText) history.push({ role: "user", content: String(userText) });
+  history.push({ role: "assistant", content: String(assistantText || "") });
 
-      existing = data || null;
-    } catch {
-      // fall through
-    }
+  const now = new Date().toISOString();
 
-    const turn: any = {
-      ts: row.ts,
-      role: row.role,
-      content: row.content,
-    };
-    if (row.route) turn.route = row.route;
-    if (row.reco_slug) turn.reco_slug = row.reco_slug;
-    if (row.rag_count != null) turn.rag_count = row.rag_count;
-    if (row.meta != null) turn.meta = row.meta;
+  const payload: any = {
+    label: "conversation",
+    conversation_id: sessionId,
+    conversation_history: history,                 // jsonb
+    content: (assistantText || "").slice(0, 4000), // optional preview
+    metadata: {
+      route,
+      reco_slug: recoSlug,
+      rag_count: ragCount ?? 0,
+      user_id: userId,
+      ts: now,
+      ...extraMeta,
+    },
+    updated_at: now,
+  };
 
-    try {
-      if (existing?.id) {
-        const prior = Array.isArray(existing.conversation_history) ? existing.conversation_history : [];
-        const updated = [...prior, turn].slice(-400); // cap to avoid unbounded growth
-        await sb
-          .from(CONVO_TABLE)
-          .update({
-            conversation_history: updated,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", existing.id);
-      } else {
-        await sb.from(CONVO_TABLE).insert({
-          id: crypto.randomUUID(),
-          label: "conversation",
-          content: null,         // keep schema happy; you don’t use this
-          metadata: null,        // keep schema happy; you don’t use this
-          conversation_id: convId,
-          conversation_history: [turn],
-          created_at: null,      // your sample shows null ok
-          updated_at: new Date().toISOString(),
-        } as any);
-      }
-    } catch {
-      // swallow — logging is best-effort
-    }
-    return;
-  }
-
-  // Fallback: generic one-row-per-message logging for any other table
   try {
-    await sb.from(CONVO_TABLE).insert(row as any);
+    const { error } = await sb
+      .from(DEBUGLOGS_TABLE)
+      .upsert(payload, { onConflict: "conversation_id" });
+    if (error) throw error;
   } catch {
-    // minimal fallback
-    const minimal = {
-      ts: row.ts,
-      session_id: row.session_id,
-      role: row.role,
-      content: row.content,
-    };
-    try {
-      await sb.from(CONVO_TABLE).insert(minimal as any);
-    } catch {
-      // swallow
-    }
+    // best-effort; do not block
   }
 }
 
@@ -502,7 +460,11 @@ export const handler: Handler = async (event) => {
       headers["X-Route"] = "noop";
       headers["X-Duration-Total"] = String(Date.now() - t0);
       headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
-      return { statusCode: 200, headers, body: JSON.stringify({ ok: true, note: "debug GET ok", policy: POLICY_VERSION }) };
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ ok: true, note: "debug GET ok", policy: POLICY_VERSION }),
+      };
     }
     headers["X-Events-Stage"] = "405";
     headers["Server-Timing"] = `total;dur=${Date.now() - t0}`;
@@ -525,13 +487,20 @@ export const handler: Handler = async (event) => {
     const clientMessages = Array.isArray(body?.messages) ? body.messages : [];
     userText =
       body?.q ??
-      [...clientMessages].reverse().find((m: any) => m?.role === "user" && typeof m?.content === "string")?.content ??
+      [...clientMessages].reverse().find((m: any) => m?.role === "user" && typeof m?.content === "string")
+        ?.content ??
       "";
     userText = String(userText).trim();
     const sessionId: string =
-      body.sessionId || (event.headers["x-session-id"] as string) || (event.headers["X-Session-Id"] as string) || "anon";
+      body.sessionId ||
+      (event.headers["x-session-id"] as string) ||
+      (event.headers["X-Session-Id"] as string) ||
+      "anon";
     const userId: string | null =
-      body.userId || (event.headers["x-user-id"] as string) || (event.headers["X-User-Id"] as string) || null;
+      body.userId ||
+      (event.headers["x-user-id"] as string) ||
+      (event.headers["X-User-Id"] as string) ||
+      null;
 
     headers["X-Events-Stage"] = "parsed";
 
@@ -577,7 +546,7 @@ export const handler: Handler = async (event) => {
           "Alternatively, Microsoft Teams could work.",
           "Try: Random External Tool",
         ].join("\n");
-        bodyText = sanitizeNeutralGuidance(rogue, allow);
+        bodyText = renumberOrderedLists(removeExternalToolMentions(stripAllTryLines(rogue), allow));
       }
 
       headers["X-Route"] = route;
@@ -586,18 +555,17 @@ export const handler: Handler = async (event) => {
       headers["X-Reco"] = String(!!recoSlug);
       if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
 
+      // best-effort transcript
       const ts = new Date().toISOString();
-      void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
-      void logMessage({
-        ts,
-        session_id: sessionId,
-        user_id: userId,
-        role: "assistant",
-        content: bodyText.trim(),
+      void upsertDebugLog({
+        sessionId,
+        userId,
+        userText,
+        assistantText: bodyText.trim(),
         route,
-        reco_slug: recoSlug,
-        rag_count: 0,
-        meta: { mode: "sim" },
+        recoSlug,
+        ragCount: 0,
+        extraMeta: { mode: "sim", ts, policy_version: POLICY_VERSION },
       });
 
       headers["X-Events-Stage"] = "success";
@@ -609,12 +577,15 @@ export const handler: Handler = async (event) => {
     // ---- Deterministic follow-up layer ----
     const follow = classifyFollowUp(userText);
 
-    // 1) memory (user first)
-    let proposed = (mem.slots && (mem.slots as any).proposed) || (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
+    // 1) from memory (user preferred)
+    let proposed =
+      (mem.slots && (mem.slots as any).proposed) ||
+      (mem.last_reco_slug ? { slug: mem.last_reco_slug } : null);
 
-    // 2) last assistant Try:
+    // 2) from last assistant Try: (requires messages[])
     if (!proposed) {
-      const lastAssistantText = [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")?.content || "";
+      const lastAssistantText =
+        [...(clientMessages || [])].reverse().find((m: any) => m?.role === "assistant")?.content || "";
       if (lastAssistantText) {
         const toolsForDetect = await getToolRegistryCached();
         const det = detectToolFromAssistant(lastAssistantText, toolsForDetect);
@@ -622,18 +593,21 @@ export const handler: Handler = async (event) => {
       }
     }
 
-    // 3) cookie
+    // 3) cookie fallback
     if (!proposed) {
       const ck = (event.headers["cookie"] as string) || (event.headers["Cookie"] as string) || "";
       const slugFromCookie = getCookie("last_reco_slug", ck);
       if (slugFromCookie) proposed = { slug: slugFromCookie };
     }
 
+    // Early deterministic paths
     if (proposed) {
       const tools = await getToolRegistryCached();
       headers["X-Tools-Len"] = String(tools.length);
       const chosen =
-        tools.find((t) => t.slug === (proposed as any).slug) || tools.find((t) => t.title === (proposed as any).title) || null;
+        tools.find((t) => t.slug === (proposed as any).slug) ||
+        tools.find((t) => t.title === (proposed as any).title) ||
+        null;
 
       if (follow === "accept" && chosen) {
         const params = ((proposed as any).params as PlanParams) || {};
@@ -652,17 +626,17 @@ export const handler: Handler = async (event) => {
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
         });
 
+        // log
         const ts = new Date().toISOString();
-        void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
-        void logMessage({
-          ts,
-          session_id: sessionId,
-          user_id: userId,
-          role: "assistant",
-          content: finalText,
+        void upsertDebugLog({
+          sessionId,
+          userId,
+          userText,
+          assistantText: finalText,
           route: "tools",
-          reco_slug: chosen.slug || null,
-          rag_count: 0,
+          recoSlug: chosen.slug || null,
+          ragCount: 0,
+          extraMeta: { ts, policy_version: POLICY_VERSION },
         });
 
         headers["X-Events-Stage"] = "success";
@@ -694,17 +668,17 @@ export const handler: Handler = async (event) => {
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: merged } },
         });
 
+        // log
         const ts = new Date().toISOString();
-        void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
-        void logMessage({
-          ts,
-          session_id: sessionId,
-          user_id: userId,
-          role: "assistant",
-          content: finalText,
+        void upsertDebugLog({
+          sessionId,
+          userId,
+          userText,
+          assistantText: finalText,
           route: "tools",
-          reco_slug: chosen.slug || null,
-          rag_count: 0,
+          recoSlug: chosen.slug || null,
+          ragCount: 0,
+          extraMeta: { ts, policy_version: POLICY_VERSION },
         });
 
         headers["X-Events-Stage"] = "success";
@@ -731,17 +705,17 @@ export const handler: Handler = async (event) => {
           slots: { proposed: { slug: chosen.slug, title: chosen.title, params: ((proposed as any).params as PlanParams) || {} } },
         });
 
+        // log
         const ts = new Date().toISOString();
-        void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
-        void logMessage({
-          ts,
-          session_id: sessionId,
-          user_id: userId,
-          role: "assistant",
-          content: blurb,
+        void upsertDebugLog({
+          sessionId,
+          userId,
+          userText,
+          assistantText: blurb,
           route: "coach",
-          reco_slug: null,
-          rag_count: 0,
+          recoSlug: null,
+          ragCount: 0,
+          extraMeta: { ts, policy_version: POLICY_VERSION },
         });
 
         headers["X-Events-Stage"] = "success";
@@ -759,7 +733,7 @@ export const handler: Handler = async (event) => {
     // ---- Router per turn (QA-first) ----
     let decision: any = await pickRoute(userText, clientMessages as any);
 
-    // optional: LLM scorer ONLY if not already QA with spans
+    // optional: let LLM scorer weigh in ONLY if not already QA with spans
     const alreadyQA = decision?.route === "qa" && (decision?.ragMeta?.count ?? 0) > 0;
 
     if (!alreadyQA) {
@@ -815,7 +789,11 @@ export const handler: Handler = async (event) => {
       const qGround = expandForGrounding(userText);
       let g = await retrieveSpans({ q: qGround, topK: 3, minScore: 0.55 });
       if (!g.spans?.length) {
-        g = await retrieveSpans({ q: `${qGround} agenda cadence expectations`, topK: 3, minScore: 0.45 });
+        g = await retrieveSpans({
+          q: `${qGround} agenda cadence expectations`,
+          topK: 3,
+          minScore: 0.45,
+        });
       }
       coachGround = g.spans || [];
       out = await CoachAgent.handle({ userText, messages: clientMessages, grounding: coachGround });
@@ -823,62 +801,54 @@ export const handler: Handler = async (event) => {
     tAfterAgent = Date.now();
 
     // ---- Policy: enforce internal tool if matched; else strip externals ----
-const tools = await getToolRegistryCached();
-headers["X-Tools-Len"] = String(tools.length);
-const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
+    const tools = await getToolRegistryCached();
+    headers["X-Tools-Len"] = String(tools.length);
+    const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
 
-let chosen: ToolRow | null = null; // <-- add this
-if (decision?.best_tool_slug) {
-  chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
-}
-if (!chosen) chosen = matchToolByIntent(userText, tools);
-if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
+    let chosen: ToolRow | null = null;
+    if (decision?.best_tool_slug) chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
+    if (!chosen) chosen = matchToolByIntent(userText, tools);
+    if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
 
-const qaLike = /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
+    const qaLike = /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
 
-let finalText: string;
-let recoSlug: string | null = null;
+    let finalText: string;
+    let recoSlug: string | null = null;
 
-// treat any routed QA with nonzero spans as QA; don't enforce tools on it
-const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
+    // treat any routed QA with nonzero spans as QA; don't enforce tools on it
+    const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
 
-if (!isQA && !qaLike && chosen) {
-  const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
-  finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
-  finalText = renumberOrderedLists(finalText);
-  recoSlug = chosen.slug || null;
-  headers["X-Route"] = "tools";
-  setCookie(headers, "last_reco_slug", recoSlug || "");
-  await setMem(userId, sessionId, {
-    last_reco_slug: recoSlug,
-    slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
-  });
-} else {
-  // QA: keep as-is; non-QA: sanitize + renumber
-  finalText = isQA
-    ? renumberOrderedLists(out?.text ?? "")
-    : sanitizeNeutralGuidance(out?.text ?? "", allow);
-    finalText = renumberOrderedLists(finalText); 
-}
-await appendTurnToDebugLogs({
-  conversationId: sessionId,         // reuse sessionId as the conversation_id
-  userText,
-  assistantText: finalText,
-});
+    if (!isQA && !qaLike && chosen) {
+      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
+      finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
+      finalText = renumberOrderedLists(finalText);
+      recoSlug = chosen.slug || null;
+      headers["X-Route"] = "tools";
+      setCookie(headers, "last_reco_slug", recoSlug || "");
+      await setMem(userId, sessionId, {
+        last_reco_slug: chosen.slug || null,
+        slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+      });
+    } else {
+      // QA: keep as-is; non-QA: strip externals & renumber
+      finalText = isQA
+        ? (out?.text ?? "")
+        : renumberOrderedLists(removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow));
+    }
     tAfterPolicy = Date.now();
 
     // ---- headers (RAG + reco) ----
     if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
 
     const ragFromRouter = Number(decision?.ragMeta?.count ?? 0);
-    const ragFromAgent = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? 0);
+    const ragFromAgent = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? (coachGround?.length || 0));
     const totalRagCount = ragFromRouter + ragFromAgent;
 
     headers["X-RAG"] = String(totalRagCount > 0);
     headers["X-RAG-Count"] = String(totalRagCount);
     headers["X-Coach-RAG-Count"] = String(ragFromAgent);
 
-    const ragMode = decision?.ragMeta?.mode ?? (out as any)?.meta?.ragMode ?? null;
+    const ragMode = decision?.ragMeta?.mode ?? (out as any)?.meta?.ragMode ?? "coach-ground";
     const embedModel = decision?.ragMeta?.model ?? (out as any)?.meta?.model ?? null;
     if (ragMode) headers["X-RAG-Mode"] = String(ragMode);
     if (embedModel) headers["X-Embed-Model"] = String(embedModel);
@@ -886,19 +856,22 @@ await appendTurnToDebugLogs({
     headers["X-Reco"] = String(!!recoSlug);
     if (recoSlug) headers["X-Reco-Slug"] = String(recoSlug);
 
-    // ---- Log transcript (user + assistant) ----
+    // ---- Log transcript (single-row upsert into public.debug_logs) ----
     const ts = new Date().toISOString();
-    void logMessage({ ts, session_id: sessionId, user_id: userId, role: "user", content: userText });
-    void logMessage({
-      ts,
-      session_id: sessionId,
-      user_id: userId,
-      role: "assistant",
-      content: finalText,
+    void upsertDebugLog({
+      sessionId,
+      userId,
+      userText,
+      assistantText: finalText,
       route: headers["X-Route"] || decision.route,
-      reco_slug: recoSlug,
-      rag_count: totalRagCount,
-      meta: { coach_grounded: coachGround?.length || 0 },
+      recoSlug,
+      ragCount: totalRagCount,
+      extraMeta: {
+        coach_grounded: coachGround?.length || 0,
+        server_timing: headers["Server-Timing"] || null,
+        policy_version: POLICY_VERSION,
+        ts,
+      },
     });
 
     // ---- telemetry (fire-and-forget) ----
@@ -926,14 +899,13 @@ await appendTurnToDebugLogs({
     headers["X-Events-Stage"] = "success";
 
     // ---- server-timing ----
-    const tEnd = Date.now();
-    tAfterTelemetry = tEnd;
+    tAfterTelemetry = Date.now();
     headers["Server-Timing"] = [
       `route;dur=${tAfterRoute - t0}`,
       `agent;dur=${tAfterAgent - tAfterRoute}`,
       `policy;dur=${tAfterPolicy - tAfterAgent}`,
       `telemetry;dur=${tAfterTelemetry - tAfterPolicy}`,
-      `total;dur=${tEnd - t0}`,
+      `total;dur=${Date.now() - t0}`,
     ].join(", ");
 
     return { statusCode: 200, headers, body: finalText };
@@ -964,16 +936,20 @@ await appendTurnToDebugLogs({
 
     headers["X-Events-Stage"] = "error";
     headers["Server-Timing"] = [
-      `route;dur=${Math.max(0, tAfterRoute - t0)}`,
-      `agent;dur=${tAfterAgent && tAfterRoute ? tAfterAgent - tAfterRoute : 0}`,
-      `policy;dur=${tAfterPolicy && tAfterAgent ? tAfterPolicy - tAfterAgent : 0}`,
+      `route;dur=${Math.max(0, 0)}`,
+      `agent;dur=0`,
+      `policy;dur=0`,
       `telemetry;dur=${Date.now() - (tAfterPolicy || t0)}`,
       `total;dur=${Date.now() - t0}`,
     ].join(", ");
 
     if (debug) {
       headers["Content-Type"] = "application/json; charset=utf-8";
-      const body = JSON.stringify({ ok: false, error: String(err?.message || err), stack: String(err?.stack || "") }, null, 2);
+      const body = JSON.stringify(
+        { ok: false, error: String(err?.message || err), stack: String(err?.stack || "") },
+        null,
+        2
+      );
       return { statusCode: 200, headers, body };
     }
 
