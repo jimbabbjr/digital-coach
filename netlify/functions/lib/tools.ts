@@ -119,21 +119,16 @@ export function matchToolByIntent(userText: string, tools: ToolDoc[]): ToolDoc |
   for (const t of tools) {
     const kws = asList(t.keywords).map((x) => x.toLowerCase());
     if (!kws.length) continue;
-    const overlap = kws.filter((k) => text.includes(k)).length;
+    let overlap = 0;
+    for (const k of kws) {
+    if (k.length >= 4 && text.includes(k)) overlap += 1;
+  }
     if (overlap > best) {
       best = overlap;
       pick = t;
     }
   }
-  if (pick) return pick;
-
-  // optional hard fallback (very common ask)
-  if (/\b(weekly|updates?|report|stand[-\s]?up|check[-\s]?in)s?\b/i.test(text)) {
-    const can = tools.find((t) => t.slug === "weekly-report-tool");
-    if (can) return can;
-  }
-
-  return null;
+  if (pick && best >=2) return pick;
 }
 
 export function formatTryLine(t: ToolDoc) {
