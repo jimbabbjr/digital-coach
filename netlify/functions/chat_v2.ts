@@ -582,40 +582,43 @@ export const handler: Handler = async (event) => {
       }
     }
 
-    // ---- Router per turn (LLM-assisted) ----
-    let decision: any = null;
-    try {
-      const tools = await getToolRegistryCached();
-      headers["X-Tools-Len"] = String(tools.length);
-      const candidates = getCandidatesFromTools(
-        tools.map((t) => ({ ...t, enabled: true })) as any,
-        userText,
-        6
-      );
-      const scored = await scoreRouteLLM({
-        apiKey: process.env.OPENAI_API_KEY,
-        model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-        messages: clientMessages as any,
-        userText,
-        candidates,
-        lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
-      });
-      if (scored && typeof scored.tool_intent_score === "number" && scored.tool_intent_score < 0.65) {
-        // ignore low-confidence tool picks; Coach will handle and policy may enforce
-      } else if (scored) {
-        decision = {
-          route: scored.route,
-          ragSpans: [],
-          ragMeta: { count: 0, mode: null, model: null },
-          best_tool_slug: scored.best_tool_slug,
-        };
-      }
-    } catch {}
-    if (!decision) decision = await pickRoute(userText, clientMessages as any);
-    // --- debug: what the router decided ---
-// --- after the line that assigns `decision` ---
+    // ---- Router per turn (QA-first) ----
+let decision: any = await pickRoute(userText, clientMessages as any);
+
+// optional: let LLM scorer weigh in ONLY if not already QA with spans
+const alreadyQA = decision?.route === "qa" && (decision?.ragMeta?.count ?? 0) > 0;
+
+if (!alreadyQA) {
+  try {
+    const tools = await getToolRegistryCached();
+    headers["X-Tools-Len"] = String(tools.length);
+    const candidates = getCandidatesFromTools ? getCandidatesFromTools(tools as any, userText, 6) : [];
+    const scored = await scoreRouteLLM({
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+      messages: clientMessages as any,
+      userText,
+      candidates,
+      lastRecoSlug: (mem.slots as any)?.proposed?.slug || mem.last_reco_slug,
+    });
+
+    // Only accept the scorer if it’s confident AND not QA
+    if (scored && scored.route !== "qa" && (scored.tool_intent_score ?? 0) >= 0.65) {
+      decision = {
+        route: scored.route,
+        ragSpans: [],
+        ragMeta: { count: 0, mode: null, model: null },
+        best_tool_slug: scored.best_tool_slug,
+        impl: (decision as any)?.impl || "qa-first-v2+llm",
+      };
+    }
+  } catch {
+    // ignore scorer failures; keep QA-first decision
+  }
+}
+
+// expose router debug
 headers["X-Route-Router"] = String(decision?.route || "");
-headers["X-Router-Impl"]  = String((decision as any)?.impl || "");
 if ((decision as any)?.impl) headers["X-Router-Impl"] = String((decision as any).impl);
     tAfterRoute = Date.now();
 
