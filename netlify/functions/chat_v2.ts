@@ -636,21 +636,25 @@ export const handler: Handler = async (event) => {
     if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
 
     let finalText: string;
-    let recoSlug: string | null = null;
+let recoSlug: string | null = null;
 
-    if (chosen) {
-      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
-      finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
-      recoSlug = chosen.slug || null;
-      headers["X-Route"] = "tools"; // reflect enforced plan in telemetry
-      setCookie(headers, "last_reco_slug", recoSlug || "");
-      await setSessionMem(sessionId, {
-        last_reco_slug: chosen.slug || null,
-        slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
-      });
-    } else {
-      finalText = removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
-    }
+// treat any routed QA with nonzero spans as QA; don't enforce tools on it
+const isQA = (decision?.route === "qa") && ((decision?.ragMeta?.count ?? 0) > 0);
+
+if (!isQA && chosen) {
+  const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
+  finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
+  recoSlug = chosen.slug || null;
+  headers["X-Route"] = "tools";
+  setCookie(headers, "last_reco_slug", recoSlug || "");
+  await setSessionMem(sessionId, {
+    last_reco_slug: chosen.slug || null,
+    slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+  });
+} else {
+  // QA: keep the agent’s answer as-is; non-QA: still strip externals
+  finalText = isQA ? (out?.text ?? "") : removeExternalToolMentions(stripAllTryLines(out?.text ?? ""), allow);
+}
     tAfterPolicy = Date.now();
 
     out = {

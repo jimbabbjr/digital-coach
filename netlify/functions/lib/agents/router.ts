@@ -1,100 +1,57 @@
 // netlify/functions/lib/agents/router.ts
 import { retrieveSpans } from "../retrieve";
-import {
-  getToolRegistry,
-  detectToolFromAssistant,
-  matchToolByIntent,
-} from "../tools";
+import { getCandidatesFromTools, scoreRouteLLM } from "./router_v2";
 
-export type Msg = {
-  role: "user" | "assistant" | "system";
-  content: string;
-};
-
-type RagMeta = {
-  count: number;
-  mode: "raw" | null;
-  model: string | null;
-};
-
-export type Decision = {
+type Decision = {
   route: "qa" | "coach" | "tools";
-  ragSpans: Array<{ text: string; url?: string | null }>;
-  ragMeta: RagMeta;
+  ragSpans: { content: string }[];
+  ragMeta: { count: number; mode: string | null; model: string | null };
+  best_tool_slug?: string | null;
 };
 
-function isAffirmation(s: string): boolean {
-  return /\b(yes|yep|y|sure|ok(ay)?|please|do it|that one|sounds good)\b/i.test(s);
-}
+export async function route(userText: string, messages: any[]): Promise<Decision> {
+  const q = String(userText || "");
+  const ql = q.toLowerCase();
 
-function looksLikeToolAsk(s: string): boolean {
-  return /\b(recommend|suggest|which|what)\b.*\b(tool|template|app|software|integration|feature)\b/i.test(
-    s
-  );
-}
+  // 1) Cheap QA hint → try RAG immediately
+  const qaHint =
+    /\b(where|link|docs?|document(ed|ation)?|policy|wiki|confluence|notion)\b/.test(ql) ||
+    /\b(find|show)\b.*\b(doc|policy|guid(e|eline)s?)\b/.test(ql);
 
-function looksLikeQuestion(s: string): boolean {
-  return /\b(what|how|which|when|why|compare|difference|steps|guide|best|elements|meetings?|updates?|report|policy|process|template)\b/i.test(
-    s
-  );
-}
-
-export async function route(userText: string, messages: Msg[] = []): Promise<Decision> {
-  const text = String(userText || "").trim();
-
-  // 0) Follow-up “yes/please” after an assistant Try: line → go tools (only if it maps to registry)
-  if (isAffirmation(text)) {
-    const lastAssistant =
-      [...messages].reverse().find((m) => m.role === "assistant")?.content || "";
-    if (lastAssistant) {
-      try {
-        const docs = await getToolRegistry();
-        const picked =
-          detectToolFromAssistant(lastAssistant, docs) ||
-          matchToolByIntent(text, docs);
-        if (picked) {
-          return {
-            route: "tools",
-            ragSpans: [],
-            ragMeta: { count: 0, mode: null, model: null },
-          };
-        }
-      } catch {
-        /* ignore registry failures; fall through */
-      }
+  if (qaHint) {
+    const { spans, meta } = await retrieveSpans({ q, topK: 4, minScore: 0.70 });
+    if (spans.length) {
+      return {
+        route: "qa",
+        ragSpans: spans,
+        ragMeta: { count: spans.length, mode: "raw", model: meta.model || null },
+      };
     }
   }
 
-  // 1) Explicit tool-seeking intent
-  if (looksLikeToolAsk(text)) {
-    return { route: "tools", ragSpans: [], ragMeta: { count: 0, mode: null, model: null } };
-  }
-
-  // 2) QA candidate? If yes, try retrieval (router owns RAG)
-  if (looksLikeQuestion(text)) {
-    try {
-      const spans = await retrieveSpans(text, 3, 0.75);
-      const count = Array.isArray(spans) ? spans.length : 0;
-
-      if (count >= 1) {
-        return {
-          route: "qa",
-          ragSpans: spans.map((s: any) => ({
-            text: String(s?.text ?? ""),
-            url: (s as any)?.url ?? null,
-          })),
-          ragMeta: {
-            count,
-            mode: "raw",
-            model: process.env.OPENAI_EMBED_MODEL || "text-embedding-ada-002",
-          },
-        };
-      }
-    } catch {
-      // retrieval outage → degrade gracefully to coach
+  // 2) LLM-assisted router (v2). If it returns, use it.
+  try {
+    const candidates = getCandidatesFromTools ? getCandidatesFromTools([], q, 6) : [];
+    const scored = await scoreRouteLLM({
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+      messages,
+      userText: q,
+      candidates,
+      lastRecoSlug: null,
+    });
+    if (scored) {
+      return {
+        route: scored.route as Decision["route"],
+        ragSpans: [],
+        ragMeta: { count: 0, mode: null, model: null },
+        best_tool_slug: scored.best_tool_slug || null,
+      };
     }
+  } catch {
+    // ignore and fall through
   }
 
-  // 3) Default path: coaching (habits, planning, templates without specific facts)
+  // 3) Default: coach
   return { route: "coach", ragSpans: [], ragMeta: { count: 0, mode: null, model: null } };
 }
