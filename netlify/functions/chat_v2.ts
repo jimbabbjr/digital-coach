@@ -15,6 +15,7 @@ import {
 
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 import { retrieveSpans } from "./lib/retrieve";
+import { appendTurnToDebugLogs } from "./lib/debug_logs";
 
 // ---------------------------
 // Supabase (telemetry, registry, memory, transcripts)
@@ -774,6 +775,11 @@ if (!isQA && !qaLike && chosen) {
     : sanitizeNeutralGuidance(out?.text ?? "", allow);
     finalText = renumberOrderedLists(finalText); 
 }
+await appendTurnToDebugLogs({
+  conversationId: sessionId,         // reuse sessionId as the conversation_id
+  userText,
+  assistantText: finalText,
+});
     tAfterPolicy = Date.now();
 
     // ---- headers (RAG + reco) ----
