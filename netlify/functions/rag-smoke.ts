@@ -5,7 +5,7 @@ import { retrieveSpans } from "./lib/retrieve";
 export const handler: Handler = async (event) => {
   try {
     const { q } = JSON.parse(event.body || "{}");
-    const { spans, meta } = await retrieveSpans({ q: String(q || ""), topK: 4, minScore: 0.6 });
+    const { spans, meta } = await retrieveSpans({ q: String(q || ""), topK: 4, minScore: 0 });
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json; charset=utf-8" },
