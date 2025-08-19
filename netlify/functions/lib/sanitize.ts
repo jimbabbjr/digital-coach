@@ -11,9 +11,9 @@ function norm(s: string) {
 }
 
 /** Build an allowlist of internal tool names from tool_docs */
-export function buildAllowlist(tools: ToolDoc[]): Set<string> {
+export function buildAllowlist(tools: ToolDoc[] | { title: string }[]): Set<string> {
   const allow = new Set<string>();
-  for (const t of tools) if (t?.title) allow.add(norm(t.title));
+  for (const t of tools as any[]) if (t?.title) allow.add(norm(t.title));
   return allow;
 }
 
@@ -96,7 +96,7 @@ function isExternalToolLine(line: string, allow: Set<string>): boolean {
 /** Remove lines that promote specific external tools (keep neutral guidance) */
 export function removeExternalToolMentions(text: string, allow: Set<string>): string {
   if (!text) return "";
-  const kept = (text.split("\n")).filter((ln) => !isExternalToolLine(ln, allow));
+  const kept = text.split("\n").filter((ln) => !isExternalToolLine(ln, allow));
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
@@ -133,38 +133,65 @@ export function enforceInternalTool(
   // collapse blank runs
   return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
-// --- add near the bottom of sanitize.ts ---
 
-/** Renumber contiguous ordered-list blocks (1., 2., 3.) after filtering */
+/**
+ * Renumber ordered lists in plain text so they appear as 1., 2., 3. ...
+ * - Works with "1. " and "1) " styles
+ * - Respects indentation (basic nested lists)
+ * - Resets after blank lines
+ * - Skips fenced code blocks ```...```
+ */
 export function renumberOrderedLists(text: string): string {
   if (!text) return "";
-  const lines = text.split("\n");
+  const lines = text.split(/\r?\n/);
 
-  const numRe = /^\s*(\d+)[\.\)]\s+/;  // 1.  or 1)
+  const numRe = /^(\s*)(\d+)([.)])(\s+)(.*)$/;  //  "  1.  rest"
+  const isBlank = (s: string) => /^\s*$/.test(s);
+  const isNumbered = (s: string) => numRe.test(s);
+
   let inBlock = false;
   let n = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
 
-    if (numRe.test(ln)) {
-      if (!inBlock) { inBlock = true; n = 1; } else { n += 1; }
-      lines[i] = ln.replace(numRe, `${n}. `);
+    // leave fenced code blocks alone and end any list
+    if (/^\s*```/.test(ln)) {
+      inBlock = false; n = 0;
       continue;
     }
 
-    // reset when we hit a blank line or a bullet/subheading
-    if (!ln.trim() || /^\s*[-•]/.test(ln) || /^\s*#{1,6}\s/.test(ln)) {
-      inBlock = false; n = 0;
+    const m = ln.match(numRe);
+    if (m) {
+      // start or continue the current list
+      if (!inBlock) { inBlock = true; n = 1; }
+      else { n += 1; }
+
+      const [, pre, , delim, space, rest] = m;
+      lines[i] = `${pre}${n}${delim}${space}${rest}`;
+      continue;
     }
+
+    // blank line *inside* a list? keep the counter if the next non-blank is numbered
+    if (inBlock && isBlank(ln)) {
+      let k = i + 1;
+      while (k < lines.length && isBlank(lines[k])) k++;
+      if (k < lines.length && isNumbered(lines[k])) {
+        // still in the same list; don't reset n/inBlock
+        continue;
+      }
+    }
+
+    // any other content ends the list
+    inBlock = false; n = 0;
   }
 
   return lines.join("\n");
 }
 
-/** One-shot cleanup for neutral guidance: strip Try lines & externals, then renumber */
+/** Neutralize + renumber in one go (use for coach/qa text that isn’t a tool plan) */
 export function sanitizeNeutralGuidance(text: string, allow: Set<string>): string {
-  const stripped = removeExternalToolMentions(stripAllTryLines(text), allow);
-  return renumberOrderedLists(stripped);
+  const stripped = stripAllTryLines(text);
+  const noExternal = removeExternalToolMentions(stripped, allow);
+  return renumberOrderedLists(noExternal);
 }
-
