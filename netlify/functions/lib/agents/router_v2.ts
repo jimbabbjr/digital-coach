@@ -10,6 +10,11 @@ export type RouteDecision = {
   tool_intent_score?: number; // 0..1
 };
 
+function isMediaAsk(t: string): boolean {
+  const s = (t || "").toLowerCase();
+  return /\b(book|books|author|read|reading list|recommend( me|ation)?s?|podcast|article|course)\b/.test(s);
+}
+
 export function isAffirmativeFollowUp(text: string): boolean {
   const t = String(text || "").trim().toLowerCase();
   return /^(yes|yep|sure|ok|okay|please|do it|go ahead|sounds good|let'?s do (it)?|make it so)\b/.test(t);
@@ -48,18 +53,23 @@ export async function scoreRouteLLM(params: {
   userText: string;
   candidates: { slug: string; title: string }[];
   lastRecoSlug?: string | null;
+  
 }): Promise<RouteDecision | null> {
   const { apiKey, model, messages, userText, candidates, lastRecoSlug } = params;
   if (!apiKey) return null;
-
+if (isMediaAsk(userText)) {
+  // Force a non-tools route so we don't hijack with Weekly Report, etc.
+  return { route: "qa" as const };
+}
   const client = new OpenAI({ apiKey: apiKey! });
 
   const sys = [
-    "You are a strict router for an internal coaching app.",
-    "Routes: 'qa' answers factual/Q&A, 'coach' gives guidance, 'tools' triggers an internal tool recommendation.",
-    "Only pick a tool slug from candidates. If none fit, do not invent one.",
-    "If user affirms a prior reco (yes please) and lastRecoSlug exists, prefer route='tools' with that slug."
-  ].join(" ");
+  "You are a strict router for an internal coaching app.",
+  "Routes: 'qa' answers factual/Q&A, 'coach' gives guidance, 'tools' triggers an internal tool recommendation.",
+  "NEVER choose 'tools' if the user is asking for books, podcasts, courses, or articles.",
+  "Only pick a tool slug from candidates. If none fit, do not invent one.",
+  "If user explicitly affirms a prior tool reco and lastRecoSlug exists, prefer route='tools' with that slug."
+].join("\n");
 
   const payload = {
     userText, lastRecoSlug: lastRecoSlug || null,
