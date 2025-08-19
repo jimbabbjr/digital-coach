@@ -1,63 +1,45 @@
-import OpenAI from "openai";
+// netlify/functions/lib/retrieve.ts
 import { createClient } from "@supabase/supabase-js";
+import OpenAI from "openai";
 
-export type Span = { text: string; url?: string; score: number; meta?: any };
+type Span = { title?: string; url?: string | null; content: string; score: number };
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!,
-  { auth: { persistSession: false } }
-);
+const sb =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+    : null;
 
-// use the same model your index used
-const EMBED_MODEL = process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
-const oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+export async function retrieveSpans(opts: {
+  q: string;
+  topK?: number;
+  minScore?: number; // 0..1, cosine-ish scaled
+}) {
+  const q = (opts.q || "").slice(0, 4000);
+  if (!q || !sb) return { spans: [] as Span[], meta: { model: null, count: 0 } };
 
-// --- tiny cache to cut repeat latency
-const embedCache = new Map<string, { v: number[]; ts: number }>();
-const EMBED_TTL_MS = 5 * 60 * 1000;
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+  const embedModel = process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
+  const { data: emb } = await openai.embeddings.create({ model: embedModel, input: q });
+  const vec = emb[0]?.embedding;
+  if (!vec) return { spans: [], meta: { model: embedModel, count: 0 } };
 
-async function embed(q: string): Promise<number[]> {
-  const key = `${EMBED_MODEL}:${q.trim().toLowerCase()}`;
-  const hit = embedCache.get(key);
-  if (hit && Date.now() - hit.ts < EMBED_TTL_MS) return hit.v;
+  // cosine distance ~ (1 - cosine_sim). We convert to a 0..1 score.
+  const topK = opts.topK ?? 4;
+  const { data, error } = await sb.rpc("match_docs", {
+    query_embedding: vec as any,
+    match_count: topK,
+  });
+  if (error || !Array.isArray(data)) return { spans: [], meta: { model: embedModel, count: 0 } };
 
-  const e = await oai.embeddings.create({ model: EMBED_MODEL, input: q });
-  const v = e.data[0].embedding as number[];
-  embedCache.set(key, { v, ts: Date.now() });
-  return v;
-}
+  const spans = (data as any[]).map((r) => ({
+    title: r.title,
+    url: r.url,
+    content: r.content,
+    score: typeof r.similarity === "number" ? r.similarity : 0,
+  }));
 
-export async function retrieveSpans(
-  query: string,
-  k = 3,
-  threshold = 0.75,   // good for ada-002 on your corpus
-  minScore = 0.35,
-  minLen = 160
-): Promise<Span[]> {
-  const v = await embed(query);
-
-  for (const t of [threshold, 0.72, 0.70, 0.65, 0.60, 0.0]) {
-    const { data, error } = await supabase.rpc("match_documents", {
-      query_embedding: v,
-      match_threshold: t,
-      match_count: Math.max(5, k),
-    });
-
-    if (error) { console.error("match_documents error", error); return []; }
-
-    const spans = ((data ?? []) as any[])
-      .map((r: any) => ({
-        text: r.content as string,
-        url: r.metadata?.url ?? r.metadata?.source ?? undefined,
-        score: r.similarity as number,
-        meta: r.metadata,
-      }))
-      .filter(s => (s.score ?? 0) >= minScore && (s.text?.length ?? 0) >= minLen)
-      .filter((s, i, arr) => i === arr.findIndex(t => t.text.slice(0,120) === s.text.slice(0,120))) // de-dupe
-      .slice(0, k);
-
-    if (spans.length) return spans;
-  }
-  return [];
+  // apply optional score floor
+  const minScore = opts.minScore ?? 0.72;
+  const filtered = spans.filter((s) => s.score >= minScore);
+  return { spans: filtered, meta: { model: embedModel, count: filtered.length } };
 }
