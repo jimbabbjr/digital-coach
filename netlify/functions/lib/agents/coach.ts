@@ -50,16 +50,17 @@ export const CoachAgent = {
     }
 
     // LLM prompt (action-oriented + grounded)
-    const system =
-      [
-        "You are an action-oriented leadership/ops coach.",
-        "Root your guidance in the CONTEXT block I provide.",
-        "Do not mention external brands or tools.",
-        "Format:",
-        "- Brief direction (2–3 sentences).",
-        "- A numbered action plan (4–6 steps, imperative).",
-        "- A tiny 'Grounded in' section listing 1–2 principle titles.",
-      ].join("\n");
+   const wantGrounding = grounding.length > 0;
+
+const system = [
+  "You are an action-oriented leadership/ops coach.",
+  wantGrounding ? "Root your guidance in the CONTEXT block. Do NOT invent facts outside it." 
+                : "There is no context; use generic leadership best practices. Do NOT add a 'Grounded in' section.",
+  "Format:",
+  "- Brief direction (2–3 sentences).",
+  "- A numbered action plan (4–6 steps, imperative).",
+  wantGrounding ? "- A tiny 'Grounded in' section listing 1–2 principle titles." : "",
+].join("\n");
 
     const user =
       [

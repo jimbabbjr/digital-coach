@@ -668,23 +668,23 @@ if (!isQA && chosen) {
 }
     tAfterPolicy = Date.now();
 
-    out = {
-      ...(out || { text: "", route: decision.route }),
-      text: finalText,
-      meta: {
-        ...(out?.meta || {}),
-        rag: decision?.ragMeta?.count ?? 0,
-        ragMode: decision?.ragMeta?.mode ?? null,
-        model: decision?.ragMeta?.model ?? null,
-        recoSlug,
-      },
-      reco: !!recoSlug,
-    };
+    const mergedMeta: any = { ...(out?.meta || {}), recoSlug };
+if (decision?.route === "qa") {
+  mergedMeta.rag     = decision?.ragMeta?.count ?? 0;
+  mergedMeta.ragMode = decision?.ragMeta?.mode  ?? "raw";
+  mergedMeta.model   = decision?.ragMeta?.model ?? mergedMeta.model ?? null;
+}
+out = {
+  ...(out || { text: "", route: decision.route }),
+  text: finalText,
+  meta: mergedMeta,
+  reco: !!recoSlug,
+};
 
-    // ---- headers ----
+   // ---- headers ----
 if (!headers["X-Route"]) headers["X-Route"] = String(out?.route ?? decision.route);
 
-// RAG: router spans + (coach grounding only)
+// router spans + (coach grounding only)
 const ragFromRouter = Number(decision?.ragMeta?.count ?? 0);
 const ragFromAgent  = decision?.route === "qa" ? 0 : Number((out as any)?.meta?.rag ?? 0);
 const totalRagCount = ragFromRouter + ragFromAgent;
@@ -692,14 +692,18 @@ const totalRagCount = ragFromRouter + ragFromAgent;
 headers["X-RAG"]       = String(totalRagCount > 0);
 headers["X-RAG-Count"] = String(totalRagCount);
 
-// Prefer router’s mode/model; fall back to agent meta (coach grounding)
-const ragMode   = decision?.ragMeta?.mode  ?? (out as any)?.meta?.ragMode ?? null;
-const embedModel= decision?.ragMeta?.model ?? (out as any)?.meta?.model   ?? null;
+// Prefer router’s mode/model; fall back to agent’s (coach grounding)
+const ragMode    = decision?.ragMeta?.mode  ?? (out as any)?.meta?.ragMode ?? null;
+const embedModel = decision?.ragMeta?.model ?? (out as any)?.meta?.model   ?? null;
 if (ragMode)    headers["X-RAG-Mode"]    = String(ragMode);
 if (embedModel) headers["X-Embed-Model"] = String(embedModel);
 
 headers["X-Reco"] = String(!!out?.reco);
 if (out?.meta?.recoSlug) headers["X-Reco-Slug"] = String(out.meta.recoSlug);
+
+// (optional for quick debugging)
+headers["X-Coach-RAG-Count"] = String(ragFromAgent);
+
 
     // ---- telemetry (fire-and-forget) ----
     const duration = Date.now() - t0;
