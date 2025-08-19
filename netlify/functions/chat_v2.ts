@@ -9,8 +9,6 @@ import { CoachAgent } from "./lib/agents/coach";
 
 import {
   buildAllowlist,
-  stripAllTryLines,
-  removeExternalToolMentions,
   renumberOrderedLists,
   sanitizeNeutralGuidance,
 } from "./lib/sanitize";
@@ -739,37 +737,42 @@ export const handler: Handler = async (event) => {
     tAfterAgent = Date.now();
 
     // ---- Policy: enforce internal tool if matched; else strip externals ----
-    const tools = await getToolRegistryCached();
-    headers["X-Tools-Len"] = String(tools.length);
-    const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
+const tools = await getToolRegistryCached();
+headers["X-Tools-Len"] = String(tools.length);
+const allow = buildAllowlist(tools.map((t) => ({ title: t.title })) as any);
 
-    let chosenTool: ToolRow | null = null;
-    if (decision?.best_tool_slug) chosenTool = tools.find((t) => t.slug === decision.best_tool_slug) || null;
-    if (!chosenTool) chosenTool = matchToolByIntent(userText, tools);
-    if (!chosenTool) chosenTool = detectToolFromAssistant(out?.text ?? "", tools);
+let chosen: ToolRow | null = null; // <-- add this
+if (decision?.best_tool_slug) {
+  chosen = tools.find((t) => t.slug === decision.best_tool_slug) || null;
+}
+if (!chosen) chosen = matchToolByIntent(userText, tools);
+if (!chosen) chosen = detectToolFromAssistant(out?.text ?? "", tools);
 
-    const qaLike = /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
+const qaLike = /\b(where|documented|docs?|wiki|handbook|policy|link|url|page)\b/i.test(userText);
 
-    let finalText = "";
-    let recoSlug: string | null = null;
+let finalText: string;
+let recoSlug: string | null = null;
 
-    // treat any routed QA with nonzero spans as QA; don't enforce tools on it
-    const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
+// treat any routed QA with nonzero spans as QA; don't enforce tools on it
+const isQA = decision?.route === "qa" && ((decision?.ragMeta?.count ?? 0) > 0);
 
-    if (!isQA && !qaLike && chosenTool) {
-      const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
-      finalText = `${renderPlanForTool(chosenTool, params)}\n\n${formatTryLine(chosenTool)}`.trim();
-      finalText = renumberOrderedLists(finalText);
-      recoSlug = chosenTool.slug || null;
-      headers["X-Route"] = "tools";
-      setCookie(headers, "last_reco_slug", recoSlug || "");
-      await setMem(userId, sessionId, {
-        last_reco_slug: chosenTool.slug || null,
-        slots: { proposed: { slug: chosenTool.slug, title: chosenTool.title, params } },
-      });
-    } else {
-      finalText = isQA ? out?.text ?? "" : sanitizeNeutralGuidance(out?.text ?? "", allow);
-    }
+if (!isQA && !qaLike && chosen) {
+  const params: PlanParams = ((mem.slots as any)?.proposed?.params as PlanParams) || {};
+  finalText = `${renderPlanForTool(chosen, params)}\n\n${formatTryLine(chosen)}`.trim();
+  finalText = renumberOrderedLists(finalText);
+  recoSlug = chosen.slug || null;
+  headers["X-Route"] = "tools";
+  setCookie(headers, "last_reco_slug", recoSlug || "");
+  await setMem(userId, sessionId, {
+    last_reco_slug: recoSlug,
+    slots: { proposed: { slug: chosen.slug, title: chosen.title, params } },
+  });
+} else {
+  // QA: keep as-is; non-QA: sanitize + renumber
+  finalText = isQA
+    ? renumberOrderedLists(out?.text ?? "")
+    : sanitizeNeutralGuidance(out?.text ?? "", allow);
+}
     tAfterPolicy = Date.now();
 
     // ---- headers (RAG + reco) ----
