@@ -16,6 +16,7 @@ import {
 import { getCandidatesFromTools, scoreRouteLLM } from "./lib/agents/router_v2";
 import { retrieveSpans } from "./lib/retrieve";
 import { appendTurnToDebugLogs } from "./lib/debug_logs";
+import crypto from "node:crypto";
 
 // ---------------------------
 // Supabase (telemetry, registry, memory, transcripts)
@@ -25,7 +26,7 @@ const sb =
     ? createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
     : null;
 
-const CONVO_TABLE = process.env.CONVO_TABLE || "conversations";
+const CONVO_TABLE = process.env.CONVO_TABLE || "public.debug_logs";
 
 // ---------------------------
 // Types & helpers
@@ -297,7 +298,8 @@ async function setMem(userId: string | null, sessionId: string, mem: { last_reco
 }
 
 // ---------------------------
-// Conversation logging (best-effort, schema-agnostic)
+// ---------------------------
+// Conversation logging (schema-aware; appends to public.debug_logs if selected)
 // ---------------------------
 type LogRow = {
   ts: string;
@@ -309,19 +311,102 @@ type LogRow = {
   reco_slug?: string | null;
   rag_count?: number | null;
   meta?: any;
+  // Optional: if you can pass a real UUID from the client, we’ll use it
+  conversation_id?: string | null;
 };
+
+function isUuid(v?: string | null) {
+  return !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+}
+
+function uuidFromString(s: string) {
+  // deterministic UUID-ish from a string (v4/v5 style—valid format for UUID column)
+  const h = crypto.createHash("sha1").update(s).digest("hex");
+  // enforce RFC4122 bits (version 4, variant 10)
+  return `${h.slice(0,8)}-${h.slice(8,12)}-4${h.slice(13,16)}-a${h.slice(17,20)}-${h.slice(20,32)}`;
+}
 
 async function logMessage(row: LogRow) {
   if (!sb) return;
+
+  // If we're targeting public.debug_logs, we need to APPEND the message to conversation_history
+  const isDebugLogs = /(^|\.)(debug_logs)$/i.test(CONVO_TABLE);
+
+  if (isDebugLogs) {
+    const convId =
+      (row.conversation_id && isUuid(row.conversation_id) && row.conversation_id) ||
+      (isUuid(row.session_id) ? row.session_id : uuidFromString(row.session_id || (row.user_id || "anon")));
+
+    // Fetch existing row for this conversation
+    let existing: any = null;
+    try {
+      const { data } = await sb
+        .from(CONVO_TABLE)
+        .select("id, conversation_history")
+        .eq("label", "conversation")
+        .eq("conversation_id", convId)
+        .limit(1)
+        .maybeSingle();
+
+      existing = data || null;
+    } catch {
+      // fall through
+    }
+
+    const turn: any = {
+      ts: row.ts,
+      role: row.role,
+      content: row.content,
+    };
+    if (row.route) turn.route = row.route;
+    if (row.reco_slug) turn.reco_slug = row.reco_slug;
+    if (row.rag_count != null) turn.rag_count = row.rag_count;
+    if (row.meta != null) turn.meta = row.meta;
+
+    try {
+      if (existing?.id) {
+        const prior = Array.isArray(existing.conversation_history) ? existing.conversation_history : [];
+        const updated = [...prior, turn].slice(-400); // cap to avoid unbounded growth
+        await sb
+          .from(CONVO_TABLE)
+          .update({
+            conversation_history: updated,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existing.id);
+      } else {
+        await sb.from(CONVO_TABLE).insert({
+          id: crypto.randomUUID(),
+          label: "conversation",
+          content: null,         // keep schema happy; you don’t use this
+          metadata: null,        // keep schema happy; you don’t use this
+          conversation_id: convId,
+          conversation_history: [turn],
+          created_at: null,      // your sample shows null ok
+          updated_at: new Date().toISOString(),
+        } as any);
+      }
+    } catch {
+      // swallow — logging is best-effort
+    }
+    return;
+  }
+
+  // Fallback: generic one-row-per-message logging for any other table
   try {
     await sb.from(CONVO_TABLE).insert(row as any);
-    return;
   } catch {
-    const minimal = { ts: row.ts, session_id: row.session_id, role: row.role, content: row.content };
+    // minimal fallback
+    const minimal = {
+      ts: row.ts,
+      session_id: row.session_id,
+      role: row.role,
+      content: row.content,
+    };
     try {
       await sb.from(CONVO_TABLE).insert(minimal as any);
     } catch {
-      // swallow — logging is best-effort
+      // swallow
     }
   }
 }
