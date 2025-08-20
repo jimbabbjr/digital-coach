@@ -14,6 +14,7 @@ function parseBody(raw: any) {
   try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
   catch { return {}; }
 }
+
 function lastUserFromMessages(messages: any[]): string {
   if (!Array.isArray(messages)) return "";
   const u = [...messages].reverse().find((m) => m?.role === "user");
@@ -23,6 +24,7 @@ function lastUserFromMessages(messages: any[]): string {
   if (Array.isArray(c)) return c.map((seg) => (seg?.text ?? seg?.content ?? "")).join(" ").trim();
   return String(c);
 }
+
 function extractUserText(payload: any): string {
   const direct =
     payload.q ??
@@ -34,8 +36,10 @@ function extractUserText(payload: any): string {
     payload.input ??
     "";
   if (direct && String(direct).trim()) return String(direct).trim();
+
   const fromMsgs = lastUserFromMessages(payload.messages || payload.history || []);
   if (fromMsgs) return fromMsgs.trim();
+
   const nested =
     payload?.data?.q ??
     payload?.data?.text ??
@@ -43,6 +47,11 @@ function extractUserText(payload: any): string {
     payload?.data?.prompt ??
     "";
   return String(nested || "").trim();
+}
+
+function isMediaAsk(s: string) {
+  const t = String(s || "").toLowerCase();
+  return /\b(book|books|author|reading\s*list|recommend(ation| me)?s?|title|read|reading|podcast|article|course|courses?)\b/.test(t);
 }
 
 /* ---------- normalizer ---------- */
@@ -101,7 +110,7 @@ function asToolArray(catalog: ToolCatalog) {
   }));
 }
 
-/* ---------- render ---------- */
+/* ---------- render (markdown) ---------- */
 
 function renderMedia(reply: any) {
   const header = reply.message || "Here are practical, nuts-and-bolts picks you can use immediately:";
@@ -115,6 +124,7 @@ function renderMedia(reply: any) {
   const ask = reply.ask ? `\n\n${reply.ask}` : "";
   return `${header}\n\n${lines.join("\n")}${ask}`.trim();
 }
+
 function renderOfferTool(reply: any) {
   const pct = Math.round((reply.confidence ?? 0) * 100);
   const conf = Number.isFinite(pct) && pct > 0 ? ` (confidence ${pct}%)` : "";
@@ -122,6 +132,24 @@ function renderOfferTool(reply: any) {
 }
 
 /* ---------- core ---------- */
+
+async function composeOnce({
+  userText, messages, toolCatalog, candidates,
+}: {
+  userText: string;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  toolCatalog: ToolCatalog;
+  candidates: Array<{ slug: string; title: string; score: number }>;
+}) {
+  const raw: Reply | any = await composeReply({
+    userText,
+    candidates,
+    toolCatalog,
+    messages,
+    model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+  });
+  return normalizeReply(raw);
+}
 
 async function processChat(payload: any) {
   const userText = extractUserText(payload);
@@ -137,6 +165,7 @@ async function processChat(payload: any) {
   const tools = asToolArray(toolCatalog);
   const candidates = tools.length ? await rankTools(userText, tools) : [];
 
+  // optional confirmation flow (lean response)
   if (confirmToolSlug) {
     const meta = toolCatalog[confirmToolSlug] || { title: confirmToolSlug, description: "" };
     const plan = await composeToolPlan({
@@ -148,16 +177,15 @@ async function processChat(payload: any) {
     return { status: 200, json: { route: "tools", text: msg } };
   }
 
-  const raw: Reply | any = await composeReply({
-    userText,
-    candidates,
-    toolCatalog,
-    messages, // <-- pass history for reference resolution
-    model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-  });
+  // 1) First pass
+  let reply = await composeOnce({ userText, messages, toolCatalog, candidates });
 
-  const reply = normalizeReply(raw);
+  // 2) Self-heal once: if it's clearly a media ask but not media_recs, retry
+  if (isMediaAsk(userText) && reply.mode !== "media_recs") {
+    reply = await composeOnce({ userText, messages, toolCatalog, candidates });
+  }
 
+  // 3) Route + render
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
 
@@ -185,7 +213,19 @@ async function processChat(payload: any) {
       break;
   }
 
-  if (!text || String(text).trim().length === 0) text = "Okay.";
+  if (!text || String(text).trim().length === 0) {
+    // last-resort safety for obviously media asks
+    if (isMediaAsk(userText)) {
+      text =
+        "Here are practical, nuts-and-bolts picks you can use immediately:\n\n" +
+        "- **The Checklist Manifesto** (Atul Gawande) — Use checklists to standardize daily work. _Takeaway:_ Write a one-page checklist for each recurring task.\n" +
+        "- **Getting Things Done** (David Allen) — Capture/clarify/organize for reliable follow-through. _Takeaway:_ Make a shared 'Next Actions' list for the team.\n" +
+        "- **Scrum: The Art of Doing Twice the Work in Half the Time** (Jeff Sutherland) — Lightweight cadence for execution. _Takeaway:_ Try a 10-minute standup and a weekly demo.\n\n" +
+        "Which one do you want to start with?";
+    } else {
+      text = "Okay.";
+    }
+  }
 
   return { status: 200, json: { route, text } };
 }
@@ -208,8 +248,14 @@ export default (async (req: Request) => {
   const payload = await req.json().catch(() => ({}));
   try {
     const out = await processChat(payload);
-    return new Response(JSON.stringify(out.json), { status: out.status, headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify(out.json), {
+      status: out.status,
+      headers: { "content-type": "application/json" },
+    });
   } catch (err: any) {
-    return new Response(JSON.stringify({ route: "qa", text: err?.message || "Internal error" }), { status: 500, headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ route: "qa", text: err?.message || "Internal error" }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
   }
 }) as any;
