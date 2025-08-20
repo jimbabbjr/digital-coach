@@ -27,6 +27,13 @@ export function expandQuery(q: string): string {
     .replace(/\bone to ones?\b/gi, "one-on-one meetings");
 }
 
+// put this near the top of retrieve.ts
+function asStringArray(x: unknown): string[] {
+  if (Array.isArray(x)) return x.map(v => String(v));
+  if (x == null) return [];
+  return [String(x)];
+}
+
 export async function retrieveSpans(opts: {
   q: string;
   topK?: number;
@@ -60,7 +67,8 @@ export async function retrieveSpans(opts: {
         content: String(r.content || ""),
         score: typeof r.similarity === "number" ? r.similarity : undefined,
       }))
-      .filter((s) => (s.score ?? 0) >= minScore);
+      // find the line like: arr.map((s) => s.trim())
+const cleaned = asStringArray(vecSpans).map((s) => s.trim()).filter(Boolean);
   } catch {
     // ignore; fall through to FTS
   }

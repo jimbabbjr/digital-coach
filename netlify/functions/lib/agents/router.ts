@@ -1,67 +1,41 @@
 // netlify/functions/lib/agents/router.ts
-import { retrieveSpans } from "../retrieve";
-import { getCandidatesFromTools, scoreRouteLLM } from "./router_v2";
+import { scoreRouteLLM } from "./router_v2";
 
-export type Decision = {
-  route: "qa" | "coach" | "tools";
-  ragSpans: { content: string }[];
+const isMediaAsk = (t: string) =>
+  /\b(book|books|author|reading\s*list|recommend( me|ation)?s?|podcast|article|course|courses?)\b/i.test(String(t || ""));
+const isAffirmative = (s: string) =>
+  /\b(yes|yep|sounds good|do it|let'?s try|ok(ay)?|go ahead)\b/i.test(String(s || ""));
+
+export type RouteUnion = "qa" | "coach" | "tools";
+export type RouteResult = {
+  impl: string;
+  route: RouteUnion;
+  ragSpans: any[];
   ragMeta: { count: number; mode: string | null; model: string | null };
-  best_tool_slug?: string | null;
-  impl?: string; // debug marker so chat_v2 can expose which router impl ran
+  best_tool_slug: string | null;
 };
 
-/**
- * QA-first router:
- * 1) If the text smells like docs/policy, try retrieval with a lenient floor.
- * 2) If nothing retrieved, ask the LLM scorer (tools vs coach).
- * 3) Default = coach.
- */
-export async function route(userText: string, messages: any[]): Promise<Decision> {
-  const q = String(userText || "");
-  const ql = q.toLowerCase();
+// Overloaded entry: (userText, messages?) OR ({ userText, messages, lastRecoSlug })
+export async function route(a: any, b?: any): Promise<RouteResult> {
+  const userText: string = typeof a === "string" ? a : a.userText;
+  const messages: any[] = typeof a === "string" ? (b || []) : (a.messages || []);
+  const lastRecoSlug: string | null = typeof a === "string" ? null : (a.lastRecoSlug ?? null);
 
-  // 1) Cheap QA hint → try RAG immediately (lenient floor for small corpora)
-  const qaHint =
-    /\b(where|link|docs?|document(ed|ation)?|policy|wiki|confluence|notion)\b/.test(ql) ||
-    /\b(find|show)\b.*\b(doc|policy|guid(e|eline)s?)\b/.test(ql);
-
-  if (qaHint) {
-    const { spans, meta } = await retrieveSpans({ q, topK: 4, minScore: 0.55 });
-    if (spans.length) {
-      return {
-        impl: "qa-first-v2",
-        route: "qa",
-        ragSpans: spans,
-        ragMeta: { count: spans.length, mode: "raw", model: meta.model || null },
-      };
-    }
+  if (isMediaAsk(userText)) {
+    return { impl: "qa-first-v2", route: "qa", ragSpans: [], ragMeta: { count: 0, mode: null, model: null }, best_tool_slug: null };
   }
 
-  // 2) LLM-assisted router (best-effort). Safe to fail.
-  try {
-    const candidates = getCandidatesFromTools ? getCandidatesFromTools([], q, 6) : [];
-    const scored = await scoreRouteLLM({
-      apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-      messages,
-      userText: q,
-      candidates,
-      lastRecoSlug: null,
-    });
+  const lastUserMsg = [...(messages || [])].reverse().find(m => m.role === "user")?.content ?? "";
+  const sticky = isAffirmative(lastUserMsg) ? lastRecoSlug : null;
 
-    if (scored) {
-      return {
-        impl: "qa-first-v2",
-        route: (scored.route as Decision["route"]) ?? "coach",
-        ragSpans: [],
-        ragMeta: { count: 0, mode: null, model: null },
-        best_tool_slug: scored.best_tool_slug || null,
-      };
-    }
-  } catch {
-    // ignore and fall through
-  }
+  const scored = await scoreRouteLLM(userText, { messages, lastRecoSlug: sticky });
+  const picked: RouteUnion = (scored?.route as RouteUnion) || "qa";
 
-  // 3) Default: coach
-  return { impl: "qa-first-v2", route: "coach", ragSpans: [], ragMeta: { count: 0, mode: null, model: null } };
+  return {
+    impl: "qa-first-v2",
+    route: picked,
+    ragSpans: [],
+    ragMeta: { count: 0, mode: null, model: null },
+    best_tool_slug: sticky,
+  };
 }

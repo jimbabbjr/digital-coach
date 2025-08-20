@@ -1,102 +1,89 @@
 // netlify/functions/lib/agents/router_v2.ts
-import OpenAI from "openai";
 import type { ToolDoc } from "../tools";
 
-export type Route = "qa" | "coach" | "tools";
+// ---------- helpers ----------
+const norm = (x: any) => String(x ?? "").toLowerCase().trim();
+const isMediaAsk = (t: string) =>
+  /\b(book|books|author|reading\s*list|recommend( me|ation)?s?|podcast|article|course|courses?)\b/i.test(String(t || ""));
 
-export type RouteDecision = {
-  route: Route;
-  best_tool_slug?: string;
-  tool_intent_score?: number; // 0..1
-};
+// ---------- candidate scorer (back-compat) ----------
+export type ToolCandidate = { slug: string; title?: string; score: number };
 
-function isMediaAsk(t: string): boolean {
-  const s = (t || "").toLowerCase();
-  return /\b(book|books|author|read|reading list|recommend( me|ation)?s?|podcast|article|course)\b/.test(s);
-}
+/** Accepts (userText, tools) OR ({ userText, tools }) — tolerant to string[] or ToolDoc[]. */
+export function getCandidatesFromTools(...args: any[]): ToolCandidate[] {
+  const a = args[0], b = args[1];
+  const userText: string = typeof a === "object" && a && "userText" in a ? a.userText : String(a ?? "");
+  const toolsRaw: any = typeof a === "object" && a && "tools" in a ? a.tools : b;
 
-export function isAffirmativeFollowUp(text: string): boolean {
-  const t = String(text || "").trim().toLowerCase();
-  return /^(yes|yep|sure|ok|okay|please|do it|go ahead|sounds good|let'?s do (it)?|make it so)\b/.test(t);
-}
+  const text = norm(userText);
+  const arr: any[] = Array.isArray(toolsRaw) ? toolsRaw : toolsRaw ? [toolsRaw] : [];
 
-export function getCandidatesFromTools(tools: ToolDoc[], userText: string, max = 6) {
-  const lower = String(userText || "").toLowerCase();
-  const scored = tools.filter(t => (t as any)?.enabled && t?.title).map(t => {
-    const patterns = (Array.isArray((t as any).patterns)
-      ? (t as any).patterns
-      : String((t as any).patterns || "").split(","))
-      .map(s => s.trim()).filter(Boolean);
-
-    let patternHits = 0;
-    for (const rx of patterns) {
-      try { if (new RegExp(rx, "i").test(userText)) patternHits++; } catch {}
-    }
-
-    const kws = (Array.isArray((t as any).keywords)
-      ? (t as any).keywords
-      : String((t as any).keywords || "").split(","))
-      .map(s => s.trim().toLowerCase()).filter(Boolean);
-
-    const kwHits = kws.reduce((n, k) => n + (lower.includes(k) ? 1 : 0), 0);
-    return { slug: (t as any).slug, title: t.title, score: patternHits * 2 + kwHits };
-  });
-
-  return scored.sort((a,b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, max);
-}
-
-// Safe wrapper: returns null if no key / model error.
-export async function scoreRouteLLM(params: {
-  apiKey?: string | null;
-  model?: string | null;
-  messages: { role: "user"|"assistant"|"system"; content: string }[];
-  userText: string;
-  candidates: { slug: string; title: string }[];
-  lastRecoSlug?: string | null;
-  
-}): Promise<RouteDecision | null> {
-  const { apiKey, model, messages, userText, candidates, lastRecoSlug } = params;
-  if (!apiKey) return null;
-if (isMediaAsk(userText)) {
-  // Force a non-tools route so we don't hijack with Weekly Report, etc.
-  return { route: "recs" as const };
-}
-  const client = new OpenAI({ apiKey: apiKey! });
-
-  const sys = [
-  "You are a strict router for an internal coaching app.",
-  "Routes: 'qa' answers factual/Q&A, 'coach' gives guidance, 'tools' triggers an internal tool recommendation.",
-  "NEVER choose 'tools' if the user is asking for books, podcasts, courses, or articles.",
-  "Only pick a tool slug from candidates. If none fit, do not invent one.",
-  "If user explicitly affirms a prior tool reco and lastRecoSlug exists, prefer route='tools' with that slug."
-].join("\n");
-
-  const payload = {
-    userText, lastRecoSlug: lastRecoSlug || null,
-    candidates: candidates.map(c => ({ slug: c.slug, title: c.title })),
-    lastAssistant: messages.slice().reverse().find(m => m.role === "assistant")?.content || null
+  const asTool = (t: any): ToolDoc => {
+    if (t && typeof t === "object" && "slug" in t) return t as ToolDoc;
+    const slug = String(t ?? "").trim();
+    return { slug, title: slug, keywords: [slug] } as ToolDoc;
   };
 
-  const res = await client.chat.completions.create({
-    model: model || "gpt-4o-mini",
-    temperature: 0,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: JSON.stringify(payload) }
-    ],
-    response_format: { type: "json_object" }
-  }).catch(() => null);
+  const STOP = new Set(["task","tasks","daily","day to day","day-to-day","everyday","update","updates","work","employee","employees"]);
+  const NEG  = ["book","books","author","reading","recommendation","podcast","article","course","courses"];
 
-  const content = res?.choices?.[0]?.message?.content || "{}";
-  try {
-    const j = JSON.parse(content);
-    const rd: RouteDecision = {
-      route: (j.route as Route) || "coach",
-      best_tool_slug: j.best_tool_slug || undefined,
-      tool_intent_score: typeof j.tool_intent_score === "number" ? j.tool_intent_score : undefined
-    };
-    return rd;
-  } catch {
-    return null;
+  // Require ≥2 meaningful hits; ignore STOP words; penalize NEG
+  const TOOL_FLOOR = 2;
+
+  return arr
+    .map(asTool)
+    .map((t) => {
+      const kw = t.keywords ?? [];
+      const list = Array.isArray(kw) ? kw : [kw];
+      let score = 0;
+      for (const k of list) {
+        const kk = norm(k);
+        if (kk.length < 4) continue;
+        if (STOP.has(kk)) continue;
+        if (text.includes(kk)) score++;
+      }
+      for (const n of NEG) if (text.includes(n)) score--;
+      return { slug: t.slug, title: t.title, score };
+    })
+    .filter(c => c.score >= TOOL_FLOOR)
+    .sort((a, b) => b.score - a.score);
+}
+
+// ---------- LLM route scoring (back-compat overloads) ----------
+export type LlmRouteResult = {
+  route: "qa" | "coach" | "tools";
+  reason: string;
+  tool_intent_score: number;
+  best_tool_slug: string | null;
+  meta: { model: string };
+};
+
+export async function scoreRouteLLM(...args: any[]): Promise<LlmRouteResult> {
+  let userText = "";
+  if (typeof args[0] === "object" && args[0] && "userText" in args[0]) {
+    userText = String(args[0].userText ?? "");
+  } else if (typeof args[0] === "string" && typeof args[1] === "string") {
+    userText = String(args[1] ?? "");  // (apiKey, userText, ctx)
+  } else {
+    userText = String(args[0] ?? "");
   }
+
+  if (isMediaAsk(userText)) {
+    return {
+      route: "qa",
+      reason: "media-ask-guard",
+      tool_intent_score: 0,
+      best_tool_slug: null,
+      meta: { model: "router-local" },
+    };
+  }
+
+  // Safe default; if you wire a real LLM router later, plug it here.
+  return {
+    route: "qa",
+    reason: "default-qa",
+    tool_intent_score: 0,
+    best_tool_slug: null,
+    meta: { model: "router-local" },
+  };
 }
