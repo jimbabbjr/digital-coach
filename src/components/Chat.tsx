@@ -1,6 +1,44 @@
+// src/components/Chat.tsx
 import { useEffect, useRef, useState } from "react";
 
 type Msg = { role: "user" | "assistant"; content: string };
+
+function escapeHtml(s: string) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// tiny Markdown → HTML (bold, italics, lists, paragraphs)
+function mdToHtml(src: string) {
+  const safe = escapeHtml(src ?? "");
+  // **bold**
+  let html = safe.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  // _italics_ (avoid underscores inside words)
+  html = html.replace(/(^|[\s(])_([^_]+)_([)\s.,!?]|$)/g, (_, a, b, c) => `${a}<em>${b}</em>${c}`);
+
+  // handle lists
+  const lines = html.split(/\r?\n/);
+  const out: string[] = [];
+  let inList = false;
+  for (const line of lines) {
+    const m = line.match(/^\s*-\s+(.*)$/);
+    if (m) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${m[1]}</li>`);
+    } else {
+      if (inList) { out.push("</ul>"); inList = false; }
+      out.push(line);
+    }
+  }
+  if (inList) out.push("</ul>");
+
+  // paragraphs (blank lines split)
+  const joined = out.join("\n");
+  const paras = joined.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  return paras.map(p => `<p>${p.replace(/\n/g, "<br/>")}</p>`).join("\n");
+}
 
 export default function Chat() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -8,18 +46,16 @@ export default function Chat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
-  // auto-scroll to the latest message
+  // auto-scroll
   useEffect(() => {
-    if (boxRef.current) {
-      boxRef.current.scrollTop = boxRef.current.scrollHeight;
-    }
+    if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
   }, [msgs]);
 
   async function send() {
     const user = (inputRef.current?.value || "").trim();
     if (!user || pending) return;
 
-    // show user message + placeholder assistant bubble immediately
+    // optimistic bubbles
     setMsgs((m) => [...m, { role: "user", content: user }, { role: "assistant", content: "…" }]);
     setPending(true);
 
@@ -30,34 +66,33 @@ export default function Chat() {
         body: JSON.stringify({ messages: [{ role: "user", content: user }] }),
       });
 
-     const route = resp.headers.get("X-Route") ?? "";
-const recoHeader = resp.headers.get("X-Reco") ?? "";
-const slug = resp.headers.get("X-Reco-Slug") ?? "";
+      // prefer JSON, fallback to text
+      const ct = resp.headers.get("content-type") || "";
+      let text = "";
+      if (ct.includes("application/json")) {
+        const data = (await resp.json().catch(() => null)) as any;
+        text = String(data?.text ?? "");
+        if (!text) {
+          for (const k of Object.keys(data || {})) {
+            if (typeof data[k] === "string" && data[k].length > 0) { text = data[k]; break; }
+          }
+        }
+      } else {
+        const bodyText = await resp.text();
+        try { text = String((JSON.parse(bodyText) as any)?.text ?? ""); }
+        catch { text = bodyText; }
+      }
 
-let bodyText = await resp.text();
-      // cooldown: hide duplicate "Try:" if it's the same slug as last time
-const lastSlug = localStorage.getItem("lastReco");
-if (slug && lastSlug === slug) {
-  bodyText = bodyText.replace(/^Try:.*$/m, "").trim();
-}
-if (slug) localStorage.setItem("lastReco", slug);
-
-const text =
-  bodyText +
-  (route ? `\n\n[route=${route}${recoHeader ? `, reco=${recoHeader}` : ""}]` : "");
+      if (!text || text === "undefined") text = "Sorry—no answer came back.";
 
       // replace the placeholder with the real answer
       setMsgs((m) =>
-        m.map((msg, i) =>
-          i === m.length - 1 ? { ...msg, content: text } : msg
-        )
+        m.map((msg, i) => (i === m.length - 1 ? { ...msg, content: text } : msg))
       );
     } catch (e: any) {
       setMsgs((m) =>
         m.map((msg, i) =>
-          i === m.length - 1
-            ? { ...msg, content: `Error: ${e?.message ?? String(e)}` }
-            : msg
+          i === m.length - 1 ? { ...msg, content: `Error: ${e?.message ?? String(e)}` } : msg
         )
       );
     } finally {
@@ -87,23 +122,26 @@ const text =
         }}
       >
         {msgs.map((m, i) => (
-          <div
-            key={i}
-            style={{
-              marginBottom: 10,
-              whiteSpace: "pre-wrap",
-              lineHeight: 1.4,
-            }}
-          >
+          <div key={i} style={{ marginBottom: 10, lineHeight: 1.4 }}>
             <strong style={{ marginRight: 6 }}>
               {m.role === "user" ? "You" : "Assistant"}:
             </strong>
-            {m.content}
+            {m.role === "assistant" ? (
+              <span
+                style={{ display: "block" }}
+                dangerouslySetInnerHTML={{ __html: mdToHtml(m.content) }}
+              />
+            ) : (
+              <span style={{ whiteSpace: "pre-wrap" }}>{m.content}</span>
+            )}
           </div>
         ))}
+
         {msgs.length === 0 && (
           <div style={{ color: "#666" }}>
-            Ask me something like:{" "}
+            <div style={{ marginBottom: 8 }}>
+              Try: <code>Book recommendation for managing day-to-day tasks with entry-level employees</code>
+            </div>
             <em>“How do I collect weekly updates without nagging the team?”</em>
           </div>
         )}
@@ -120,6 +158,8 @@ const text =
           borderRadius: 6,
           border: "1px solid #ddd",
           resize: "vertical",
+          minHeight: 64,
+          font: "inherit",
         }}
       />
 

@@ -14,11 +14,14 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.55.0",
     "cors": "^2.8.5",
+    "dompurify": "^3.2.6",
     "express": "^4.18.2",
     "lucide-react": "^0.344.0",
     "openai": "^4.24.7",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",
