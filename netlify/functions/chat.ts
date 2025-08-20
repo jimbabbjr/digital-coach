@@ -33,13 +33,16 @@ function extractUserText(payload: any): string {
   return String(nested || "").trim();
 }
 
-/* ---------- selection detection ---------- */
+/* ---------- selection detection from history ---------- */
 function norm(s: string) { return String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim(); }
 function extractTitlesFromAssistant(text: string): string[] {
   const titles: string[] = [];
   const boldLines = text.match(/-\s+\*\*([^*]+)\*\*/g) || [];
   for (const line of boldLines) { const m = /-\s+\*\*([^*]+)\*\*/.exec(line); if (m?.[1]) titles.push(m[1].trim()); }
-  for (const ln of text.split(/\r?\n/)) { const m = /^\s*-\s+(.+?)(?:\s+—|\s+\(|$)/.exec(ln); if (m?.[1]) titles.push(m[1].replace(/\*\*/g, "").trim()); }
+  for (const ln of text.split(/\r?\n/)) {
+    const m = /^\s*-\s+(.+?)(?:\s+—|\s+\(|$)/.exec(ln);
+    if (m?.[1]) titles.push(m[1].replace(/\*\*/g, "").trim());
+  }
   return Array.from(new Set(titles));
 }
 function detectSelectionTitle(userText: string, messages: Array<{ role: "user" | "assistant"; content: string }>): string | null {
@@ -48,6 +51,7 @@ function detectSelectionTitle(userText: string, messages: Array<{ role: "user" |
   const lastAssistant = [...(messages || [])].reverse().find(m => m.role === "assistant")?.content || "";
   const titles = extractTitlesFromAssistant(String(lastAssistant || ""));
   if (!titles.length) return null;
+
   const qWords = query.split(" ").filter(Boolean);
   let best: { title: string; score: number } | null = null;
   for (const title of titles) {
@@ -61,7 +65,7 @@ function detectSelectionTitle(userText: string, messages: Array<{ role: "user" |
   return null;
 }
 
-/* ---------- normalizer ---------- */
+/* ---------- reply normalization ---------- */
 
 type AnyReply = any;
 function normalizeReply(raw: AnyReply) {
@@ -109,30 +113,57 @@ function normalizeReply(raw: AnyReply) {
 
 type ToolCatalog = Record<string, { title: string; description: string; defaultSlots?: Record<string, any> }>;
 function asToolArray(catalog: ToolCatalog) {
-  return Object.entries(catalog || {}).map(([slug, t]) => ({ slug, title: t.title || slug, description: t.description || "" }));
+  return Object.entries(catalog || {}).map(([slug, t]) => ({
+    slug,
+    title: t.title || slug,
+    description: t.description || "",
+  }));
 }
 
-/* ---------- render (markdown) ---------- */
+/* ---------- deep-dive hardening ---------- */
 
-function renderMedia(reply: any) {
-  const header = reply.message || "Here are practical, nuts-and-bolts picks you can use immediately:";
-  const list = Array.isArray(reply.items) ? reply.items : [];
-  const lines = list.map((i: any) => {
-    const by = i.by ? ` (${i.by})` : "";
-    const why = i.why ? ` — ${i.why}` : "";
-    const take = i.takeaway ? ` _Takeaway:_ ${i.takeaway}` : "";
-    return `- **${i.title || "Untitled"}**${by}${why}${take}`;
-  });
-  const ask = reply.ask ? `\n\n${reply.ask}` : "";
-  return `${header}\n\n${lines.join("\n")}${ask}`.trim();
+function looksLikeDeepDive(s: string) {
+  const t = String(s || "");
+  const hasNumbers = /(^|\n)\s*\d+\)/.test(t) || /(^|\n)\s*\d+\./.test(t);
+  const hasBullets = /(^|\n)\s*-\s+/.test(t);
+  const longEnough = t.replace(/\s+/g, " ").length >= 180;
+  return (hasNumbers || hasBullets) && longEnough;
 }
-function renderOfferTool(reply: any) {
-  const pct = Math.round((reply.confidence ?? 0) * 100);
-  const conf = Number.isFinite(pct) && pct > 0 ? ` (confidence ${pct}%)` : "";
-  return `${reply.message}\n\n**${reply.tool_slug}**${conf}\n${reply.confirm_cta}`;
+function deepDiveFallback(selectionTitle: string | null, userText: string) {
+  const title = selectionTitle || (/checklist/i.test(userText) ? "The Checklist Manifesto" : "the selected book");
+  const why = title.toLowerCase().includes("checklist")
+    ? "It turns messy daily work into a repeatable routine your least-experienced team member can run."
+    : "It gives you a concrete way to standardize daily work for entry-level employees.";
+
+  return [
+    `Why **${title}**: ${why}`,
+    "",
+    "Here’s a 1-day rollout you can run today:",
+    "1) **Pick a pilot task & role.** Choose one recurring task handled by entry-level staff (5–15 min). Define a simple *Definition of Done (DoD)*.",
+    "2) **Draft a 1-page checklist (5–9 steps).** Include: Title & Purpose, When it runs, Steps, DoD, Common Pitfalls.",
+    "3) **Co-create with one frontline worker (15 min).** Walk the draft; fix ambiguous verbs and missing prerequisites.",
+    "4) **Pilot 3 runs today.** Supervisor observes, enforces checklist use, and logs snags; update the checklist once.",
+    "5) **Make it visible.** Print and post at the workstation; store a PDF in your shared drive (`SOP/Checklists/<Team>/<Task>`).",
+    "6) **Train & enforce.** 10-minute huddle: demo once, then require initials next to the DoD. Assign an owner for upkeep.",
+    "7) **Measure & tune weekly.** Track completion rate and rework. Retire, merge, or tighten steps as needed.",
+    "",
+    "**Copy-paste template (1 page):**",
+    "- *Title*: <Task Name>",
+    "- *Purpose*: Why this exists (1 line)",
+    "- *When*: Start trigger → End condition",
+    "- *Steps*: ",
+    "  - [ ] Step 1",
+    "  - [ ] Step 2",
+    "  - [ ] Step 3",
+    "- *Definition of Done*: 2–4 bullet checks",
+    "- *Common Pitfalls*: 2–3 bullets",
+    "- *Owner*: Role / Name",
+    "",
+    "Want me to fill this template for your team’s top task? (Yes/No)",
+  ].join("\n");
 }
 
-/* ---------- core ---------- */
+/* ---------- compose wrapper ---------- */
 
 async function composeOnce({
   userText, messages, toolCatalog, candidates, hints,
@@ -154,6 +185,8 @@ async function composeOnce({
   return normalizeReply(raw);
 }
 
+/* ---------- core ---------- */
+
 async function processChat(payload: any) {
   const userText = extractUserText(payload);
   const messages: Array<{ role: "user" | "assistant"; content: string }> = payload.messages ?? [];
@@ -170,7 +203,11 @@ async function processChat(payload: any) {
 
   if (confirmToolSlug) {
     const meta = toolCatalog[confirmToolSlug] || { title: confirmToolSlug, description: "" };
-    const plan = await composeToolPlan({ approvalText: approvalText || userText, tool_slug: confirmToolSlug, toolMeta: meta });
+    const plan = await composeToolPlan({
+      approvalText: approvalText || userText,
+      tool_slug: confirmToolSlug,
+      toolMeta: meta,
+    });
     const msg = plan.message || `I'll configure **${meta.title || confirmToolSlug}** with: ${JSON.stringify(plan.slots)}`;
     return { status: 200, json: { route: "tools", text: msg } };
   }
@@ -178,27 +215,41 @@ async function processChat(payload: any) {
   const selectionTitle = detectSelectionTitle(userText, messages);
 
   // First pass
-  let reply = await composeOnce({ userText, messages, toolCatalog, candidates, hints: { selection_title: selectionTitle } });
+  let reply = await composeOnce({
+    userText,
+    messages,
+    toolCatalog,
+    candidates,
+    hints: { selection_title: selectionTitle },
+  });
 
-  // Self-heal once if we detected a selection but didn't get deep_dive
-  if (selectionTitle && reply.mode !== "deep_dive") {
-    reply = await composeOnce({ userText, messages, toolCatalog, candidates, hints: { selection_title: selectionTitle } });
+  // If we detected a selection and got a flimsy deep_dive, retry once
+  if (selectionTitle && reply.mode === "deep_dive" && !looksLikeDeepDive(reply.message)) {
+    reply = await composeOnce({
+      userText,
+      messages,
+      toolCatalog,
+      candidates,
+      hints: { selection_title: selectionTitle },
+    });
   }
 
+  // Route + render
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
+
   switch (reply.mode) {
-    case "media_recs": route = "qa"; text = renderMedia(reply); break;
-    case "offer_tool": route = "tools"; text = renderOfferTool(reply); break;
-    case "deep_dive":  route = "coach"; text = reply.message; break;
+    case "media_recs": route = "qa";   text = renderMedia(reply); break;
+    case "offer_tool": route = "tools"; text = `${reply.message}\n\n**${reply.tool_slug}**\n${reply.confirm_cta}`; break;
+    case "deep_dive":  route = "coach"; text = looksLikeDeepDive(reply.message) ? reply.message : deepDiveFallback(selectionTitle, userText); break;
     case "coach":      route = "coach"; text = reply.message; break;
     case "qa":
-    default:           route = "qa"; text = reply.message; break;
+    default:           route = "qa";   text = reply.message; break;
   }
 
   if (!text || String(text).trim().length === 0) {
     text = selectionTitle
-      ? `Here’s a concrete starter for **${selectionTitle}**:\n\n1) Define the critical steps.\n2) Draft a one-page checklist.\n3) Pilot with one entry-level role.\n4) Timebox revisions.\n5) Roll out team-wide.\n\nWant me to tailor a checklist template for your team? (Yes/No)`
+      ? deepDiveFallback(selectionTitle, userText)
       : "Okay.";
   }
 

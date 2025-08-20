@@ -70,7 +70,7 @@ function detectSelectionTitle(userText: string, messages: Array<{ role: "user" |
   return null;
 }
 
-/* ---------- normalizer ---------- */
+/* ---------- reply normalization ---------- */
 
 type AnyReply = any;
 function normalizeReply(raw: AnyReply) {
@@ -125,7 +125,7 @@ function asToolArray(catalog: ToolCatalog) {
   }));
 }
 
-/* ---------- renderers (markdown) ---------- */
+/* ---------- renderers ---------- */
 
 function renderMedia(reply: any) {
   const header = reply.message || "Here are practical, nuts-and-bolts picks you can use immediately:";
@@ -139,13 +139,52 @@ function renderMedia(reply: any) {
   const ask = reply.ask ? `\n\n${reply.ask}` : "";
   return `${header}\n\n${lines.join("\n")}${ask}`.trim();
 }
-function renderOfferTool(reply: any) {
-  const pct = Math.round((reply.confidence ?? 0) * 100);
-  const conf = Number.isFinite(pct) && pct > 0 ? ` (confidence ${pct}%)` : "";
-  return `${reply.message}\n\n**${reply.tool_slug}**${conf}\n${reply.confirm_cta}`;
+
+/* ---------- deep-dive hardening ---------- */
+
+function looksLikeDeepDive(s: string) {
+  const t = String(s || "");
+  const hasNumbers = /(^|\n)\s*\d+\)/.test(t) || /(^|\n)\s*\d+\./.test(t);
+  const hasBullets = /(^|\n)\s*-\s+/.test(t);
+  const longEnough = t.replace(/\s+/g, " ").length >= 180;
+  return (hasNumbers || hasBullets) && longEnough;
 }
 
-/* ---------- core ---------- */
+function deepDiveFallback(selectionTitle: string | null, userText: string) {
+  const title = selectionTitle || (/checklist/i.test(userText) ? "The Checklist Manifesto" : "the selected book");
+  const why = title.toLowerCase().includes("checklist")
+    ? "It turns messy daily work into a repeatable routine your least-experienced team member can run."
+    : "It gives you a concrete way to standardize daily work for entry-level employees.";
+
+  return [
+    `Why **${title}**: ${why}`,
+    "",
+    "Here’s a 1-day rollout you can run today:",
+    "1) **Pick a pilot task & role.** Choose one recurring task handled by entry-level staff (5–15 min). Define a simple *Definition of Done (DoD)*.",
+    "2) **Draft a 1-page checklist (5–9 steps).** Include: Title & Purpose, When it runs, Steps, DoD, Common Pitfalls.",
+    "3) **Co-create with one frontline worker (15 min).** Walk the draft; fix ambiguous verbs and missing prerequisites.",
+    "4) **Pilot 3 runs today.** Supervisor observes, enforces checklist use, and logs snags; update the checklist once.",
+    "5) **Make it visible.** Print and post at the workstation; store a PDF in your shared drive (`SOP/Checklists/<Team>/<Task>`).",
+    "6) **Train & enforce.** 10-minute huddle: demo once, then require initials next to the DoD. Assign an owner for upkeep.",
+    "7) **Measure & tune weekly.** Track completion rate and rework. Retire, merge, or tighten steps as needed.",
+    "",
+    "**Copy-paste template (1 page):**",
+    "- *Title*: <Task Name>",
+    "- *Purpose*: Why this exists (1 line)",
+    "- *When*: Start trigger → End condition",
+    "- *Steps*: ",
+    "  - [ ] Step 1",
+    "  - [ ] Step 2",
+    "  - [ ] Step 3",
+    "- *Definition of Done*: 2–4 bullet checks",
+    "- *Common Pitfalls*: 2–3 bullets",
+    "- *Owner*: Role / Name",
+    "",
+    "Want me to fill this template for your team’s top task? (Yes/No)",
+  ].join("\n");
+}
+
+/* ---------- compose wrapper ---------- */
 
 async function composeOnce({
   userText, messages, toolCatalog, candidates, hints,
@@ -167,6 +206,8 @@ async function composeOnce({
   return normalizeReply(raw);
 }
 
+/* ---------- core ---------- */
+
 async function processChatV2(payload: any) {
   const userText = extractUserText(payload);
   const messages: Array<{ role: "user" | "assistant"; content: string }> = payload.messages ?? [];
@@ -181,6 +222,7 @@ async function processChatV2(payload: any) {
   const tools = asToolArray(toolCatalog);
   const candidates = tools.length ? await rankTools(userText, tools) : [];
 
+  // optional confirmation flow
   if (confirmToolSlug) {
     const meta = toolCatalog[confirmToolSlug] || { title: confirmToolSlug, description: "" };
     const plan = await composeToolPlan({
@@ -192,15 +234,27 @@ async function processChatV2(payload: any) {
     return { status: 200, json: { route: "tools", text: msg } };
   }
 
-  // Selection detection from last assistant list
+  // Detect selection (e.g., "checklist manifesto") from previous assistant list
   const selectionTitle = detectSelectionTitle(userText, messages);
 
   // First pass
-  let reply = await composeOnce({ userText, messages, toolCatalog, candidates, hints: { selection_title: selectionTitle } });
+  let reply = await composeOnce({
+    userText,
+    messages,
+    toolCatalog,
+    candidates,
+    hints: { selection_title: selectionTitle },
+  });
 
-  // If we detected a selection but didn't get deep_dive, retry once
-  if (selectionTitle && reply.mode !== "deep_dive") {
-    reply = await composeOnce({ userText, messages, toolCatalog, candidates, hints: { selection_title: selectionTitle } });
+  // If we detected a selection but got a flimsy deep_dive, retry once
+  if (selectionTitle && reply.mode === "deep_dive" && !looksLikeDeepDive(reply.message)) {
+    reply = await composeOnce({
+      userText,
+      messages,
+      toolCatalog,
+      candidates,
+      hints: { selection_title: selectionTitle },
+    });
   }
 
   // Route + render
@@ -209,21 +263,33 @@ async function processChatV2(payload: any) {
 
   switch (reply.mode) {
     case "media_recs":
-      route = "qa"; text = renderMedia(reply); break;
+      route = "qa";
+      text = renderMedia(reply);
+      break;
     case "offer_tool":
-      route = "tools"; text = renderOfferTool(reply); break;
+      route = "tools";
+      text = `${reply.message}\n\n**${reply.tool_slug}**\n${reply.confirm_cta}`;
+      break;
     case "deep_dive":
-      route = "coach"; text = reply.message; break;
+      route = "coach";
+      text = looksLikeDeepDive(reply.message)
+        ? reply.message
+        : deepDiveFallback(selectionTitle, userText);
+      break;
     case "coach":
-      route = "coach"; text = reply.message; break;
+      route = "coach";
+      text = reply.message;
+      break;
     case "qa":
     default:
-      route = "qa"; text = reply.message; break;
+      route = "qa";
+      text = reply.message;
+      break;
   }
 
   if (!text || String(text).trim().length === 0) {
     text = selectionTitle
-      ? `Here’s a concrete starter for **${selectionTitle}**:\n\n1) Define the critical steps.\n2) Draft a one-page checklist.\n3) Pilot with one entry-level role.\n4) Timebox revisions.\n5) Roll out team-wide.\n\nWant me to tailor a checklist template for your team? (Yes/No)`
+      ? deepDiveFallback(selectionTitle, userText)
       : "Okay.";
   }
 
