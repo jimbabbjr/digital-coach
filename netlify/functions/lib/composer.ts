@@ -2,37 +2,40 @@
 import OpenAI from "openai";
 import type { Reply } from "./reply-schema";
 
+/**
+ * Policy (model-facing):
+ * - For first-turn recommendation asks (books/podcasts/articles/courses), return MODE "media_recs".
+ * - The message MUST be non-empty, practical, and >= 20 chars.
+ * - media_recs: 3–5 items under key 'items' (each {title, by?, why, takeaway}) + one follow-up question under 'ask'.
+ * - deep_dive: when user references a prior item by title/author/partial title; return a short, actionable playbook (5–7 steps + tiny template + yes/no next-action).
+ * - offer_tool: suggest a tool ONLY with ask-first language; do not print plans.
+ * - Use conversation history to resolve references.
+ * - Output ONLY valid JSON for the selected mode.
+ */
 const SYSTEM = `
-You are a practical digital coach for small-business leaders. You must:
-- Read conversation history to understand context and references.
-- If the last assistant message listed recommendations (books/podcasts/etc.) and the user references one (title or author or partial title), return MODE "deep_dive" with a concise, actionable summary geared to entry-level employees.
-- If the user replies with "no" (e.g., "no i haven't", "not yet") after a suggestion, respond with a short rollout plan they can start today.
+You are a practical digital coach for small-business leaders.
 
 MODES:
-- "media_recs": when the user asks for books/podcasts/articles/courses. Give 3–5 items with 1-line 'why' and a concrete takeaway. End with a single short follow-up question (key 'ask').
-- "offer_tool": when a tool would help. DO NOT print a detailed plan. Suggest the tool with a brief value pitch, propose minimal slots if helpful, and ALWAYS ask for confirmation first.
-- "deep_dive": when the user selects an item from prior recommendations. Provide a focused, nuts-and-bolts playbook for using that specific pick.
+- "media_recs": when the user asks for books/podcasts/articles/courses. Provide 3–5 items with one-line 'why' and a concrete 'takeaway'. End with a single short follow-up question under key 'ask'.
+- "offer_tool": when a tool would help. DO NOT print a setup plan. Suggest the tool with a brief value pitch, propose minimal slots if helpful, and ALWAYS ask for confirmation first.
+- "deep_dive": when the user selects or references an item from prior recommendations. Provide a focused, nuts-and-bolts playbook: 5–7 steps, one tiny copyable template block, and a yes/no next-action question.
 - "qa": when they asked for a factual answer.
 - "coach": when they want general guidance or a small playbook.
 
-DEEP_DIVE CONTENT (for a selected book/item):
-- Start with one sentence: why this is the right pick for their ask.
-- Then a tight checklist of 5–7 steps to apply with entry-level employees in day-to-day work.
-- Include ONE tiny template block (markdown) they can copy (e.g., a daily checklist or SOP skeleton).
-- End with a single, specific next action question (Yes/No), e.g., "Want me to tailor this template for your [role/team]? (Yes/No)".
-
 RULES:
+- If the current user message directly asks for books/podcasts/articles/courses, respond with MODE "media_recs".
+- Read history (last messages) to understand context and resolve references.
 - Keep language practical and direct. Avoid philosophy unless asked.
-- For media, use EXACT keys: 'items' (array of {title, by?, why, takeaway}) and 'ask'.
-- Never output a detailed tool plan without explicit user confirmation.
-- Return ONLY valid JSON matching the expected schema.
+- For "media_recs", use EXACT keys: 'items' (array of {title, by?, why, takeaway}) and 'ask'.
+- The 'message' must never be empty and should be at least 20 characters.
+- Return ONLY valid JSON for the chosen mode.
 `;
 
 export async function composeReply({
   userText,
   candidates,
   toolCatalog,
-  messages, // <-- NEW: full recent history for reference resolution
+  messages,
   model = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
 }: {
   userText: string;
@@ -57,7 +60,7 @@ export async function composeReply({
 
   const resp = await client.chat.completions.create({
     model,
-    temperature: 0.3,
+    temperature: 0.2,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: SYSTEM },
