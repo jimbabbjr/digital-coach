@@ -52,6 +52,57 @@ function isAffirmative(s: string) {
   return /\b(yes|yep|sure|sounds good|do it|let'?s (go|try|do)( it)?|ok(ay)?|go ahead|please do)\b/.test(x);
 }
 
+function isMediaAsk(s: string) {
+  return /\b(book|books|author|reading\s*list|recommend( me|ation)?s?|podcast|article|course|courses?)\b/i.test(
+    String(s || "")
+  );
+}
+
+/* ---------- normalizer ---------- */
+
+type AnyReply = any;
+
+function normalizeReply(raw: AnyReply) {
+  const r = raw || {};
+  const mode = r.mode;
+
+  if (mode === "media_recs") {
+    const itemsSrc = r.items ?? r.recommendations ?? r.recs ?? [];
+    const items = (Array.isArray(itemsSrc) ? itemsSrc : []).map((it: any) => ({
+      title: it.title ?? it.name ?? "",
+      by: it.by ?? it.author ?? it.writer ?? undefined,
+      why: it.why ?? it.reason ?? it.why_this ?? "",
+      takeaway: it.takeaway ?? it.key_takeaway ?? it.tip ?? "",
+    }));
+    const ask = r.ask ?? r.follow_up ?? r.followup ?? undefined;
+    const message =
+      r.message ??
+      r.header ??
+      "Here are practical, nuts-and-bolts picks you can use immediately:";
+    return { mode: "media_recs", message, items, ask };
+  }
+
+  if (mode === "offer_tool") {
+    return {
+      mode: "offer_tool",
+      tool_slug: r.tool_slug ?? r.slug ?? r.tool ?? "",
+      confidence: typeof r.confidence === "number" ? r.confidence : (r.score ?? 0),
+      slots: r.slots ?? r.defaults ?? {},
+      message:
+        r.message ??
+        r.pitch ??
+        "This tool looks like a good fit for this problem.",
+      confirm_cta: r.confirm_cta ?? "Want me to set this up? (Yes / No)",
+      requires_confirmation: true,
+    };
+  }
+
+  return {
+    mode: mode === "coach" ? "coach" : "qa",
+    message: String(r.message ?? r.text ?? "").trim() || "Got it.",
+  };
+}
+
 /* ---------- tool catalog ---------- */
 
 type ToolCatalog = Record<string, { title: string; description: string; defaultSlots?: Record<string, any> }>;
@@ -65,15 +116,22 @@ function asToolArray(catalog: ToolCatalog) {
 
 /* ---------- renderers ---------- */
 
-function renderMedia(reply: Extract<Reply, { mode: "media_recs" }>) {
-  const items = (reply.items || [])
-    .map((i) => `- **${i.title}**${i.by ? ` (${i.by})` : ""} — ${i.why} _Takeaway:_ ${i.takeaway}`)
-    .join("\n");
-  const tail = reply.ask ? `\n\n${reply.ask}` : "";
-  return `${reply.message}\n\n${items}${tail}`.trim();
+function renderMedia(reply: any) {
+  const header =
+    reply.message ||
+    "Here are practical, nuts-and-bolts picks you can use immediately:";
+  const list = Array.isArray(reply.items) ? reply.items : [];
+  const lines = list.map((i: any) => {
+    const by = i.by ? ` (${i.by})` : "";
+    const why = i.why ? ` — ${i.why}` : "";
+    const take = i.takeaway ? ` _Takeaway:_ ${i.takeaway}` : "";
+    return `- **${i.title || "Untitled"}**${by}${why}${take}`;
+  });
+  const ask = reply.ask ? `\n\n${reply.ask}` : "";
+  return `${header}\n\n${lines.join("\n")}${ask}`.trim();
 }
 
-function renderOfferTool(reply: Extract<Reply, { mode: "offer_tool" }>) {
+function renderOfferTool(reply: any) {
   const pct = Math.round((reply.confidence ?? 0) * 100);
   const conf = Number.isFinite(pct) && pct > 0 ? ` (confidence ${pct}%)` : "";
   return `${reply.message}\n\n**${reply.tool_slug}**${conf}\n${reply.confirm_cta}`;
@@ -103,26 +161,27 @@ async function processChat(payload: any) {
       toolMeta: meta,
     });
     const msg = plan.message || `I'll configure **${meta.title || confirmToolSlug}** with: ${JSON.stringify(plan.slots)}`;
-    return {
-      status: 200,
-      json: {
-        route: "tools",
-        impl: "composer-v1",
-        text: msg,
-        reco: false,
-        recoSlug: confirmToolSlug,
-        plan,
-        meta: { composer: "composeToolPlan", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini" },
-      },
+    const body = {
+      route: "tools",
+      impl: "composer-v1",
+      text: msg,
+      reco: false,
+      recoSlug: confirmToolSlug,
+      plan,
+      meta: { composer: "composeToolPlan", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini" },
     };
+    const debug = Boolean(payload?.debug || payload?.__debug || process.env.API_DEBUG);
+    return { status: 200, json: debug ? body : { route: body.route, text: body.text } };
   }
 
-  const reply: Reply = await composeReply({
+  const rawReply = await composeReply({
     userText,
     candidates,
     toolCatalog,
     model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
   });
+
+  const reply = normalizeReply(rawReply);
 
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
@@ -151,26 +210,30 @@ async function processChat(payload: any) {
       break;
   }
 
+  if (!text || String(text).trim().length === 0) {
+    text = reply.message || "Okay.";
+  }
+
   const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
   const allowSticky = isAffirmative(lastUser);
   if (!allowSticky) {
     // keep reco=false
   }
 
-  return {
-    status: 200,
-    json: {
-      route,
-      impl: "composer-v1",
-      text,
-      reco,
-      recoSlug,
-      candidates,
-      reply,
-      meta: { composer: "composeReply", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini" },
-      inputUsed: userText,
-    },
+  const base = {
+    route,
+    impl: "composer-v1",
+    text,
+    reco,
+    recoSlug,
+    candidates,
+    reply,
+    meta: { composer: "composeReply", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini", isMediaAsk: isMediaAsk(userText) },
+    inputUsed: userText,
   };
+
+  const debug = Boolean(payload?.debug || payload?.__debug || process.env.API_DEBUG);
+  return { status: 200, json: debug ? base : { route: base.route, text: base.text } };
 }
 
 /* ---------- Netlify handlers ---------- */
