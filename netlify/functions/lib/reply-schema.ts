@@ -14,8 +14,12 @@ export type Reply =
       confidence: number; // 0..1
       slots?: Record<string, string | number | boolean>;
       message: string;     // short value pitch
-      confirm_cta: string; // e.g., "Want me to set this up?"
+      confirm_cta: string; // e.g., "Want me to set this up? (Yes / No)"
       requires_confirmation: true;
+    }
+  | {
+      mode: "deep_dive";   // user referenced an item from a prior list
+      message: string;     // full markdown with concrete steps/templates
     }
   | {
       mode: "qa" | "coach";

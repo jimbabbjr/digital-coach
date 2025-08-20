@@ -5,18 +5,10 @@ import type { Handler } from "@netlify/functions";
 import { rankTools } from "./lib/tool-select";
 import { composeReply } from "./lib/composer";
 import { composeToolPlan } from "./lib/plan-compose";
+import type { Reply } from "./lib/reply-schema";
 
 /* ---------- helpers ---------- */
 
-function isAffirmative(s: string) {
-  const x = String(s || "").toLowerCase();
-  return /\b(yes|yep|sure|sounds good|do it|let'?s (go|try|do)( it)?|ok(ay)?|go ahead|please do)\b/.test(x);
-}
-function isMediaAsk(s: string) {
-  return /\b(book|books|author|reading\s*list|recommend( me|ation)?s?|podcast|article|course|courses?)\b/i.test(
-    String(s || "")
-  );
-}
 function parseBody(raw: any) {
   if (!raw) return {};
   try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
@@ -53,7 +45,7 @@ function extractUserText(payload: any): string {
   return String(nested || "").trim();
 }
 
-/* ---------- normalizer (maps model wobble → stable shape) ---------- */
+/* ---------- normalizer ---------- */
 
 type AnyReply = any;
 
@@ -69,12 +61,9 @@ function normalizeReply(raw: AnyReply) {
       why: it.why ?? it.reason ?? it.why_this ?? "",
       takeaway: it.takeaway ?? it.key_takeaway ?? it.tip ?? "",
     }));
-
     const ask = r.ask ?? r.follow_up ?? r.followUpQuestion ?? r.followup ?? undefined;
-
     const msgCandidate = (r.message ?? r.header ?? "");
     const message = String(msgCandidate).trim() || "Here are practical, nuts-and-bolts picks you can use immediately:";
-
     return { mode: "media_recs", message, items, ask };
   }
 
@@ -92,11 +81,13 @@ function normalizeReply(raw: AnyReply) {
     };
   }
 
+  if (mode === "deep_dive") {
+    const base = String((r.message ?? "")).trim();
+    return { mode: "deep_dive", message: base || "Here’s a concrete next-step plan you can run today." };
+  }
+
   const base = String((r.message ?? r.text ?? "")).trim();
-  return {
-    mode: mode === "coach" ? "coach" : "qa",
-    message: base || "Got it.",
-  };
+  return { mode: mode === "coach" ? "coach" : "qa", message: base || "Got it." };
 }
 
 /* ---------- tool catalog ---------- */
@@ -110,7 +101,7 @@ function asToolArray(catalog: ToolCatalog) {
   }));
 }
 
-/* ---------- renderers (no hard-coded plans) ---------- */
+/* ---------- render (markdown text only) ---------- */
 
 function renderMedia(reply: any) {
   const header = reply.message || "Here are practical, nuts-and-bolts picks you can use immediately:";
@@ -146,7 +137,6 @@ async function processChatV2(payload: any) {
   const tools = asToolArray(toolCatalog);
   const candidates = tools.length ? await rankTools(userText, tools) : [];
 
-  // Optional explicit confirmation path
   if (confirmToolSlug) {
     const meta = toolCatalog[confirmToolSlug] || { title: confirmToolSlug, description: "" };
     const plan = await composeToolPlan({
@@ -158,41 +148,46 @@ async function processChatV2(payload: any) {
     return { status: 200, json: { route: "tools", text: msg } };
   }
 
-  // Compose + normalize
-  const raw = await composeReply({
+  // NEW: pass recent messages so the model can resolve references like "checklist manifesto"
+  const raw: Reply | any = await composeReply({
     userText,
     candidates,
     toolCatalog,
+    messages, // <-- important
     model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
   });
+
   const reply = normalizeReply(raw);
 
-  // Route + render
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
 
-  if (reply.mode === "media_recs") {
-    route = "qa";
-    text = renderMedia(reply);
-  } else if (reply.mode === "offer_tool") {
-    route = "tools";
-    text = renderOfferTool(reply); // ask-first
-  } else if (reply.mode === "coach") {
-    route = "coach";
-    text = reply.message;
-  } else {
-    route = "qa";
-    text = reply.message;
+  switch (reply.mode) {
+    case "media_recs":
+      route = "qa";
+      text = renderMedia(reply);
+      break;
+    case "offer_tool":
+      route = "tools";
+      text = renderOfferTool(reply);
+      break;
+    case "deep_dive":
+      route = "coach";         // deep dive is guidance
+      text = reply.message;
+      break;
+    case "coach":
+      route = "coach";
+      text = reply.message;
+      break;
+    case "qa":
+    default:
+      route = "qa";
+      text = reply.message;
+      break;
   }
 
-  if (!text || String(text).trim().length === 0) {
-    text = "Okay.";
-  }
+  if (!text || String(text).trim().length === 0) text = "Okay.";
 
-  // No sticky tool unless explicitly affirmed (we don’t expose flags here anyway)
-  void isAffirmative([...messages].reverse().find((m) => m.role === "user")?.content ?? "");
-
-  // ALWAYS return lean payload (no debug blob)
   return { status: 200, json: { route, text } };
 }
 

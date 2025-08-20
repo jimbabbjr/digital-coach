@@ -5,6 +5,7 @@ import type { Handler } from "@netlify/functions";
 import { rankTools } from "./lib/tool-select";
 import { composeReply } from "./lib/composer";
 import { composeToolPlan } from "./lib/plan-compose";
+import type { Reply } from "./lib/reply-schema";
 
 /* ---------- helpers ---------- */
 
@@ -80,11 +81,13 @@ function normalizeReply(raw: AnyReply) {
     };
   }
 
+  if (mode === "deep_dive") {
+    const base = String((r.message ?? "")).trim();
+    return { mode: "deep_dive", message: base || "Here’s a concrete next-step plan you can run today." };
+  }
+
   const base = String((r.message ?? r.text ?? "")).trim();
-  return {
-    mode: mode === "coach" ? "coach" : "qa",
-    message: base || "Got it.",
-  };
+  return { mode: mode === "coach" ? "coach" : "qa", message: base || "Got it." };
 }
 
 /* ---------- tool catalog ---------- */
@@ -98,14 +101,14 @@ function asToolArray(catalog: ToolCatalog) {
   }));
 }
 
-/* ---------- renderers ---------- */
+/* ---------- render ---------- */
 
 function renderMedia(reply: any) {
   const header = reply.message || "Here are practical, nuts-and-bolts picks you can use immediately:";
   const list = Array.isArray(reply.items) ? reply.items : [];
   const lines = list.map((i: any) => {
     const by = i.by ? ` (${i.by})` : "";
-       const why = i.why ? ` — ${i.why}` : "";
+    const why = i.why ? ` — ${i.why}` : "";
     const take = i.takeaway ? ` _Takeaway:_ ${i.takeaway}` : "";
     return `- **${i.title || "Untitled"}**${by}${why}${take}`;
   });
@@ -122,6 +125,7 @@ function renderOfferTool(reply: any) {
 
 async function processChat(payload: any) {
   const userText = extractUserText(payload);
+  const messages: Array<{ role: "user" | "assistant"; content: string }> = payload.messages ?? [];
   const toolCatalog: ToolCatalog = payload.toolCatalog ?? {};
   const confirmToolSlug: string | null = payload.confirm_tool_slug ?? null;
   const approvalText: string | null = payload.approval_text ?? null;
@@ -144,36 +148,45 @@ async function processChat(payload: any) {
     return { status: 200, json: { route: "tools", text: msg } };
   }
 
-  const raw = await composeReply({
+  const raw: Reply | any = await composeReply({
     userText,
     candidates,
     toolCatalog,
+    messages, // <-- pass history for reference resolution
     model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
   });
+
   const reply = normalizeReply(raw);
 
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
 
-  if (reply.mode === "media_recs") {
-    route = "qa";
-    text = renderMedia(reply);
-  } else if (reply.mode === "offer_tool") {
-    route = "tools";
-    text = renderOfferTool(reply);
-  } else if (reply.mode === "coach") {
-    route = "coach";
-    text = reply.message;
-  } else {
-    route = "qa";
-    text = reply.message;
+  switch (reply.mode) {
+    case "media_recs":
+      route = "qa";
+      text = renderMedia(reply);
+      break;
+    case "offer_tool":
+      route = "tools";
+      text = renderOfferTool(reply);
+      break;
+    case "deep_dive":
+      route = "coach";
+      text = reply.message;
+      break;
+    case "coach":
+      route = "coach";
+      text = reply.message;
+      break;
+    case "qa":
+    default:
+      route = "qa";
+      text = reply.message;
+      break;
   }
 
-  if (!text || String(text).trim().length === 0) {
-    text = "Okay.";
-  }
+  if (!text || String(text).trim().length === 0) text = "Okay.";
 
-  // ALWAYS return lean payload
   return { status: 200, json: { route, text } };
 }
 
