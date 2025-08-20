@@ -5,7 +5,6 @@ import type { Handler } from "@netlify/functions";
 import { rankTools } from "./lib/tool-select";
 import { composeReply } from "./lib/composer";
 import { composeToolPlan } from "./lib/plan-compose";
-import type { Reply } from "./lib/reply-schema";
 
 /* ---------- helpers ---------- */
 
@@ -14,7 +13,6 @@ function parseBody(raw: any) {
   try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
   catch { return {}; }
 }
-
 function lastUserFromMessages(messages: any[]): string {
   if (!Array.isArray(messages)) return "";
   const u = [...messages].reverse().find((m) => m?.role === "user");
@@ -24,7 +22,6 @@ function lastUserFromMessages(messages: any[]): string {
   if (Array.isArray(c)) return c.map((seg) => (seg?.text ?? seg?.content ?? "")).join(" ").trim();
   return String(c);
 }
-
 function extractUserText(payload: any): string {
   const direct =
     payload.q ??
@@ -47,17 +44,6 @@ function extractUserText(payload: any): string {
   return String(nested || "").trim();
 }
 
-function isAffirmative(s: string) {
-  const x = String(s || "").toLowerCase();
-  return /\b(yes|yep|sure|sounds good|do it|let'?s (go|try|do)( it)?|ok(ay)?|go ahead|please do)\b/.test(x);
-}
-
-function isMediaAsk(s: string) {
-  return /\b(book|books|author|reading\s*list|recommend( me|ation)?s?|podcast|article|course|courses?)\b/i.test(
-    String(s || "")
-  );
-}
-
 /* ---------- normalizer ---------- */
 
 type AnyReply = any;
@@ -74,32 +60,30 @@ function normalizeReply(raw: AnyReply) {
       why: it.why ?? it.reason ?? it.why_this ?? "",
       takeaway: it.takeaway ?? it.key_takeaway ?? it.tip ?? "",
     }));
-    const ask = r.ask ?? r.follow_up ?? r.followup ?? undefined;
-    const message =
-      r.message ??
-      r.header ??
-      "Here are practical, nuts-and-bolts picks you can use immediately:";
+    const ask = r.ask ?? r.follow_up ?? r.followUpQuestion ?? r.followup ?? undefined;
+    const msgCandidate = (r.message ?? r.header ?? "");
+    const message = String(msgCandidate).trim() || "Here are practical, nuts-and-bolts picks you can use immediately:";
     return { mode: "media_recs", message, items, ask };
   }
 
   if (mode === "offer_tool") {
+    const pitch = (r.message ?? r.pitch ?? "");
+    const message = String(pitch).trim() || "This tool looks like a good fit for this problem.";
     return {
       mode: "offer_tool",
       tool_slug: r.tool_slug ?? r.slug ?? r.tool ?? "",
       confidence: typeof r.confidence === "number" ? r.confidence : (r.score ?? 0),
       slots: r.slots ?? r.defaults ?? {},
-      message:
-        r.message ??
-        r.pitch ??
-        "This tool looks like a good fit for this problem.",
+      message,
       confirm_cta: r.confirm_cta ?? "Want me to set this up? (Yes / No)",
       requires_confirmation: true,
     };
   }
 
+  const base = String((r.message ?? r.text ?? "")).trim();
   return {
     mode: mode === "coach" ? "coach" : "qa",
-    message: String(r.message ?? r.text ?? "").trim() || "Got it.",
+    message: base || "Got it.",
   };
 }
 
@@ -117,20 +101,17 @@ function asToolArray(catalog: ToolCatalog) {
 /* ---------- renderers ---------- */
 
 function renderMedia(reply: any) {
-  const header =
-    reply.message ||
-    "Here are practical, nuts-and-bolts picks you can use immediately:";
+  const header = reply.message || "Here are practical, nuts-and-bolts picks you can use immediately:";
   const list = Array.isArray(reply.items) ? reply.items : [];
   const lines = list.map((i: any) => {
     const by = i.by ? ` (${i.by})` : "";
-    const why = i.why ? ` — ${i.why}` : "";
+       const why = i.why ? ` — ${i.why}` : "";
     const take = i.takeaway ? ` _Takeaway:_ ${i.takeaway}` : "";
     return `- **${i.title || "Untitled"}**${by}${why}${take}`;
   });
   const ask = reply.ask ? `\n\n${reply.ask}` : "";
   return `${header}\n\n${lines.join("\n")}${ask}`.trim();
 }
-
 function renderOfferTool(reply: any) {
   const pct = Math.round((reply.confidence ?? 0) * 100);
   const conf = Number.isFinite(pct) && pct > 0 ? ` (confidence ${pct}%)` : "";
@@ -141,13 +122,12 @@ function renderOfferTool(reply: any) {
 
 async function processChat(payload: any) {
   const userText = extractUserText(payload);
-  const messages: Array<{ role: "user" | "assistant"; content: string }> = payload.messages ?? [];
   const toolCatalog: ToolCatalog = payload.toolCatalog ?? {};
   const confirmToolSlug: string | null = payload.confirm_tool_slug ?? null;
   const approvalText: string | null = payload.approval_text ?? null;
 
   if (!userText && !confirmToolSlug) {
-    return { status: 400, json: { error: "Missing 'q' (user text)" } };
+    return { status: 400, json: { route: "qa", text: "Please type your question." } };
   }
 
   const tools = asToolArray(toolCatalog);
@@ -161,79 +141,40 @@ async function processChat(payload: any) {
       toolMeta: meta,
     });
     const msg = plan.message || `I'll configure **${meta.title || confirmToolSlug}** with: ${JSON.stringify(plan.slots)}`;
-    const body = {
-      route: "tools",
-      impl: "composer-v1",
-      text: msg,
-      reco: false,
-      recoSlug: confirmToolSlug,
-      plan,
-      meta: { composer: "composeToolPlan", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini" },
-    };
-    const debug = Boolean(payload?.debug || payload?.__debug || process.env.API_DEBUG);
-    return { status: 200, json: debug ? body : { route: body.route, text: body.text } };
+    return { status: 200, json: { route: "tools", text: msg } };
   }
 
-  const rawReply = await composeReply({
+  const raw = await composeReply({
     userText,
     candidates,
     toolCatalog,
     model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
   });
-
-  const reply = normalizeReply(rawReply);
+  const reply = normalizeReply(raw);
 
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
-  let reco = false;
-  let recoSlug: string | null = null;
 
-  switch (reply.mode) {
-    case "media_recs":
-      route = "qa";
-      text = renderMedia(reply);
-      break;
-    case "offer_tool":
-      route = "tools";
-      text = renderOfferTool(reply);
-      reco = false; // ask-first only
-      recoSlug = reply.tool_slug;
-      break;
-    case "coach":
-      route = "coach";
-      text = reply.message;
-      break;
-    case "qa":
-    default:
-      route = "qa";
-      text = reply.message;
-      break;
+  if (reply.mode === "media_recs") {
+    route = "qa";
+    text = renderMedia(reply);
+  } else if (reply.mode === "offer_tool") {
+    route = "tools";
+    text = renderOfferTool(reply);
+  } else if (reply.mode === "coach") {
+    route = "coach";
+    text = reply.message;
+  } else {
+    route = "qa";
+    text = reply.message;
   }
 
   if (!text || String(text).trim().length === 0) {
-    text = reply.message || "Okay.";
+    text = "Okay.";
   }
 
-  const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-  const allowSticky = isAffirmative(lastUser);
-  if (!allowSticky) {
-    // keep reco=false
-  }
-
-  const base = {
-    route,
-    impl: "composer-v1",
-    text,
-    reco,
-    recoSlug,
-    candidates,
-    reply,
-    meta: { composer: "composeReply", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini", isMediaAsk: isMediaAsk(userText) },
-    inputUsed: userText,
-  };
-
-  const debug = Boolean(payload?.debug || payload?.__debug || process.env.API_DEBUG);
-  return { status: 200, json: debug ? base : { route: base.route, text: base.text } };
+  // ALWAYS return lean payload
+  return { status: 200, json: { route, text } };
 }
 
 /* ---------- Netlify handlers ---------- */
@@ -245,23 +186,17 @@ export const handler: Handler = async (event) => {
     const out = await processChat(payload);
     return { statusCode: out.status, body: JSON.stringify(out.json) };
   } catch (err: any) {
-    return { statusCode: 500, body: JSON.stringify({ error: err?.message || "Internal error" }) };
+    return { statusCode: 500, body: JSON.stringify({ route: "qa", text: err?.message || "Internal error" }) };
   }
 };
 
 export default (async (req: Request) => {
-  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  if (req.method !== "POST") return new Response(JSON.stringify({ route: "qa", text: "Method Not Allowed" }), { status: 405 });
   const payload = await req.json().catch(() => ({}));
   try {
     const out = await processChat(payload);
-    return new Response(JSON.stringify(out.json), {
-      status: out.status,
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(JSON.stringify(out.json), { status: out.status, headers: { "content-type": "application/json" } });
   } catch (err: any) {
-    return new Response(JSON.stringify({ error: err?.message || "Internal error" }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(JSON.stringify({ route: "qa", text: err?.message || "Internal error" }), { status: 500, headers: { "content-type": "application/json" } });
   }
 }) as any;
