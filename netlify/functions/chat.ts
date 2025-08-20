@@ -7,19 +7,52 @@ import { composeReply } from "./lib/composer";
 import { composeToolPlan } from "./lib/plan-compose";
 import type { Reply } from "./lib/reply-schema";
 
+/* ---------- helpers ---------- */
+
 function parseBody(raw: any) {
   if (!raw) return {};
-  try {
-    return typeof raw === "string" ? JSON.parse(raw) : raw;
-  } catch {
-    return {};
-  }
+  try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
+  catch { return {}; }
+}
+
+function lastUserFromMessages(messages: any[]): string {
+  if (!Array.isArray(messages)) return "";
+  const u = [...messages].reverse().find((m) => m?.role === "user");
+  const c = u?.content;
+  if (!c) return "";
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((seg) => (seg?.text ?? seg?.content ?? "")).join(" ").trim();
+  return String(c);
+}
+
+function extractUserText(payload: any): string {
+  const direct =
+    payload.q ??
+    payload.query ??
+    payload.text ??
+    payload.message ??
+    payload.prompt ??
+    payload.content ??
+    payload.input ??
+    "";
+  if (direct && String(direct).trim()) return String(direct).trim();
+  const fromMsgs = lastUserFromMessages(payload.messages || payload.history || []);
+  if (fromMsgs) return fromMsgs.trim();
+  const nested =
+    payload?.data?.q ??
+    payload?.data?.text ??
+    payload?.data?.message ??
+    payload?.data?.prompt ??
+    "";
+  return String(nested || "").trim();
 }
 
 function isAffirmative(s: string) {
   const x = String(s || "").toLowerCase();
-  return /\b(yes|yep|sure|sounds good|do it|let'?s (go|try|do) (it)?|ok(ay)?|go ahead|please do)\b/.test(x);
+  return /\b(yes|yep|sure|sounds good|do it|let'?s (go|try|do)( it)?|ok(ay)?|go ahead|please do)\b/.test(x);
 }
+
+/* ---------- tool catalog ---------- */
 
 type ToolCatalog = Record<string, { title: string; description: string; defaultSlots?: Record<string, any> }>;
 function asToolArray(catalog: ToolCatalog) {
@@ -30,12 +63,11 @@ function asToolArray(catalog: ToolCatalog) {
   }));
 }
 
+/* ---------- renderers ---------- */
+
 function renderMedia(reply: Extract<Reply, { mode: "media_recs" }>) {
   const items = (reply.items || [])
-    .map(
-      (i) =>
-        `- **${i.title}**${i.by ? ` (${i.by})` : ""} — ${i.why} _Takeaway:_ ${i.takeaway}`
-    )
+    .map((i) => `- **${i.title}**${i.by ? ` (${i.by})` : ""} — ${i.why} _Takeaway:_ ${i.takeaway}`)
     .join("\n");
   const tail = reply.ask ? `\n\n${reply.ask}` : "";
   return `${reply.message}\n\n${items}${tail}`.trim();
@@ -47,18 +79,17 @@ function renderOfferTool(reply: Extract<Reply, { mode: "offer_tool" }>) {
   return `${reply.message}\n\n**${reply.tool_slug}**${conf}\n${reply.confirm_cta}`;
 }
 
+/* ---------- core ---------- */
+
 async function processChat(payload: any) {
-  const userText: string = String(payload.q ?? payload.query ?? "").trim();
+  const userText = extractUserText(payload);
   const messages: Array<{ role: "user" | "assistant"; content: string }> = payload.messages ?? [];
   const toolCatalog: ToolCatalog = payload.toolCatalog ?? {};
   const confirmToolSlug: string | null = payload.confirm_tool_slug ?? null;
   const approvalText: string | null = payload.approval_text ?? null;
 
   if (!userText && !confirmToolSlug) {
-    return {
-      status: 400,
-      json: { error: "Missing 'q' (user text)" },
-    };
+    return { status: 400, json: { error: "Missing 'q' (user text)" } };
   }
 
   const tools = asToolArray(toolCatalog);
@@ -71,9 +102,7 @@ async function processChat(payload: any) {
       tool_slug: confirmToolSlug,
       toolMeta: meta,
     });
-    const msg =
-      plan.message ||
-      `I'll configure **${meta.title || confirmToolSlug}** with: ${JSON.stringify(plan.slots)}`;
+    const msg = plan.message || `I'll configure **${meta.title || confirmToolSlug}** with: ${JSON.stringify(plan.slots)}`;
     return {
       status: 200,
       json: {
@@ -125,7 +154,7 @@ async function processChat(payload: any) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
   const allowSticky = isAffirmative(lastUser);
   if (!allowSticky) {
-    // no sticky tool auto-run
+    // keep reco=false
   }
 
   return {
@@ -138,36 +167,27 @@ async function processChat(payload: any) {
       recoSlug,
       candidates,
       reply,
-      meta: {
-        composer: "composeReply",
-        model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
-      },
+      meta: { composer: "composeReply", model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini" },
+      inputUsed: userText,
     },
   };
 }
 
-/** Netlify v1 handler */
+/* ---------- Netlify handlers ---------- */
+
 export const handler: Handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
-  }
+  if (event.httpMethod !== "POST") return { statusCode: 405, body: "Method Not Allowed" };
   const payload = parseBody(event.body);
   try {
     const out = await processChat(payload);
     return { statusCode: out.status, body: JSON.stringify(out.json) };
   } catch (err: any) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: err?.message || "Internal error" }),
-    };
+    return { statusCode: 500, body: JSON.stringify({ error: err?.message || "Internal error" }) };
   }
 };
 
-/** Netlify v2 default export (compatible) */
 export default (async (req: Request) => {
-  if (req.method !== "POST") {
-    return new Response("Method Not Allowed", { status: 405 });
-  }
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   const payload = await req.json().catch(() => ({}));
   try {
     const out = await processChat(payload);
