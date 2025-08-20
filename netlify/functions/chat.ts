@@ -14,7 +14,6 @@ function parseBody(raw: any) {
   try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
   catch { return {}; }
 }
-
 function lastUserFromMessages(messages: any[]): string {
   if (!Array.isArray(messages)) return "";
   const u = [...messages].reverse().find((m) => m?.role === "user");
@@ -24,40 +23,47 @@ function lastUserFromMessages(messages: any[]): string {
   if (Array.isArray(c)) return c.map((seg) => (seg?.text ?? seg?.content ?? "")).join(" ").trim();
   return String(c);
 }
-
 function extractUserText(payload: any): string {
   const direct =
-    payload.q ??
-    payload.query ??
-    payload.text ??
-    payload.message ??
-    payload.prompt ??
-    payload.content ??
-    payload.input ??
-    "";
+    payload.q ?? payload.query ?? payload.text ?? payload.message ?? payload.prompt ?? payload.content ?? payload.input ?? "";
   if (direct && String(direct).trim()) return String(direct).trim();
-
   const fromMsgs = lastUserFromMessages(payload.messages || payload.history || []);
   if (fromMsgs) return fromMsgs.trim();
-
-  const nested =
-    payload?.data?.q ??
-    payload?.data?.text ??
-    payload?.data?.message ??
-    payload?.data?.prompt ??
-    "";
+  const nested = payload?.data?.q ?? payload?.data?.text ?? payload?.data?.message ?? payload?.data?.prompt ?? "";
   return String(nested || "").trim();
 }
 
-function isMediaAsk(s: string) {
-  const t = String(s || "").toLowerCase();
-  return /\b(book|books|author|reading\s*list|recommend(ation| me)?s?|title|read|reading|podcast|article|course|courses?)\b/.test(t);
+/* ---------- selection detection ---------- */
+function norm(s: string) { return String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim(); }
+function extractTitlesFromAssistant(text: string): string[] {
+  const titles: string[] = [];
+  const boldLines = text.match(/-\s+\*\*([^*]+)\*\*/g) || [];
+  for (const line of boldLines) { const m = /-\s+\*\*([^*]+)\*\*/.exec(line); if (m?.[1]) titles.push(m[1].trim()); }
+  for (const ln of text.split(/\r?\n/)) { const m = /^\s*-\s+(.+?)(?:\s+—|\s+\(|$)/.exec(ln); if (m?.[1]) titles.push(m[1].replace(/\*\*/g, "").trim()); }
+  return Array.from(new Set(titles));
+}
+function detectSelectionTitle(userText: string, messages: Array<{ role: "user" | "assistant"; content: string }>): string | null {
+  const query = norm(userText).replace(/\b(the|a|an)\b/g, "").trim();
+  if (!query || query.length < 3) return null;
+  const lastAssistant = [...(messages || [])].reverse().find(m => m.role === "assistant")?.content || "";
+  const titles = extractTitlesFromAssistant(String(lastAssistant || ""));
+  if (!titles.length) return null;
+  const qWords = query.split(" ").filter(Boolean);
+  let best: { title: string; score: number } | null = null;
+  for (const title of titles) {
+    const tNorm = norm(title).replace(/\b(the|a|an)\b/g, "").trim();
+    let score = 0;
+    for (const w of qWords) if (w.length >= 3 && tNorm.includes(w)) score += 1;
+    if (tNorm.includes(query)) score += 2;
+    if (!best || score > best.score) best = { title, score };
+  }
+  if (best && best.score >= Math.max(2, Math.ceil(qWords.length / 2))) return best.title;
+  return null;
 }
 
 /* ---------- normalizer ---------- */
 
 type AnyReply = any;
-
 function normalizeReply(raw: AnyReply) {
   const r = raw || {};
   const mode = r.mode;
@@ -103,11 +109,7 @@ function normalizeReply(raw: AnyReply) {
 
 type ToolCatalog = Record<string, { title: string; description: string; defaultSlots?: Record<string, any> }>;
 function asToolArray(catalog: ToolCatalog) {
-  return Object.entries(catalog || {}).map(([slug, t]) => ({
-    slug,
-    title: t.title || slug,
-    description: t.description || "",
-  }));
+  return Object.entries(catalog || {}).map(([slug, t]) => ({ slug, title: t.title || slug, description: t.description || "" }));
 }
 
 /* ---------- render (markdown) ---------- */
@@ -124,7 +126,6 @@ function renderMedia(reply: any) {
   const ask = reply.ask ? `\n\n${reply.ask}` : "";
   return `${header}\n\n${lines.join("\n")}${ask}`.trim();
 }
-
 function renderOfferTool(reply: any) {
   const pct = Math.round((reply.confidence ?? 0) * 100);
   const conf = Number.isFinite(pct) && pct > 0 ? ` (confidence ${pct}%)` : "";
@@ -134,18 +135,20 @@ function renderOfferTool(reply: any) {
 /* ---------- core ---------- */
 
 async function composeOnce({
-  userText, messages, toolCatalog, candidates,
+  userText, messages, toolCatalog, candidates, hints,
 }: {
   userText: string;
   messages: Array<{ role: "user" | "assistant"; content: string }>;
   toolCatalog: ToolCatalog;
   candidates: Array<{ slug: string; title: string; score: number }>;
+  hints?: { selection_title?: string | null };
 }) {
   const raw: Reply | any = await composeReply({
     userText,
     candidates,
     toolCatalog,
     messages,
+    hints,
     model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
   });
   return normalizeReply(raw);
@@ -165,66 +168,38 @@ async function processChat(payload: any) {
   const tools = asToolArray(toolCatalog);
   const candidates = tools.length ? await rankTools(userText, tools) : [];
 
-  // optional confirmation flow (lean response)
   if (confirmToolSlug) {
     const meta = toolCatalog[confirmToolSlug] || { title: confirmToolSlug, description: "" };
-    const plan = await composeToolPlan({
-      approvalText: approvalText || userText,
-      tool_slug: confirmToolSlug,
-      toolMeta: meta,
-    });
+    const plan = await composeToolPlan({ approvalText: approvalText || userText, tool_slug: confirmToolSlug, toolMeta: meta });
     const msg = plan.message || `I'll configure **${meta.title || confirmToolSlug}** with: ${JSON.stringify(plan.slots)}`;
     return { status: 200, json: { route: "tools", text: msg } };
   }
 
-  // 1) First pass
-  let reply = await composeOnce({ userText, messages, toolCatalog, candidates });
+  const selectionTitle = detectSelectionTitle(userText, messages);
 
-  // 2) Self-heal once: if it's clearly a media ask but not media_recs, retry
-  if (isMediaAsk(userText) && reply.mode !== "media_recs") {
-    reply = await composeOnce({ userText, messages, toolCatalog, candidates });
+  // First pass
+  let reply = await composeOnce({ userText, messages, toolCatalog, candidates, hints: { selection_title: selectionTitle } });
+
+  // Self-heal once if we detected a selection but didn't get deep_dive
+  if (selectionTitle && reply.mode !== "deep_dive") {
+    reply = await composeOnce({ userText, messages, toolCatalog, candidates, hints: { selection_title: selectionTitle } });
   }
 
-  // 3) Route + render
   let route: "qa" | "coach" | "tools" = "qa";
   let text = "";
-
   switch (reply.mode) {
-    case "media_recs":
-      route = "qa";
-      text = renderMedia(reply);
-      break;
-    case "offer_tool":
-      route = "tools";
-      text = renderOfferTool(reply);
-      break;
-    case "deep_dive":
-      route = "coach";
-      text = reply.message;
-      break;
-    case "coach":
-      route = "coach";
-      text = reply.message;
-      break;
+    case "media_recs": route = "qa"; text = renderMedia(reply); break;
+    case "offer_tool": route = "tools"; text = renderOfferTool(reply); break;
+    case "deep_dive":  route = "coach"; text = reply.message; break;
+    case "coach":      route = "coach"; text = reply.message; break;
     case "qa":
-    default:
-      route = "qa";
-      text = reply.message;
-      break;
+    default:           route = "qa"; text = reply.message; break;
   }
 
   if (!text || String(text).trim().length === 0) {
-    // last-resort safety for obviously media asks
-    if (isMediaAsk(userText)) {
-      text =
-        "Here are practical, nuts-and-bolts picks you can use immediately:\n\n" +
-        "- **The Checklist Manifesto** (Atul Gawande) — Use checklists to standardize daily work. _Takeaway:_ Write a one-page checklist for each recurring task.\n" +
-        "- **Getting Things Done** (David Allen) — Capture/clarify/organize for reliable follow-through. _Takeaway:_ Make a shared 'Next Actions' list for the team.\n" +
-        "- **Scrum: The Art of Doing Twice the Work in Half the Time** (Jeff Sutherland) — Lightweight cadence for execution. _Takeaway:_ Try a 10-minute standup and a weekly demo.\n\n" +
-        "Which one do you want to start with?";
-    } else {
-      text = "Okay.";
-    }
+    text = selectionTitle
+      ? `Here’s a concrete starter for **${selectionTitle}**:\n\n1) Define the critical steps.\n2) Draft a one-page checklist.\n3) Pilot with one entry-level role.\n4) Timebox revisions.\n5) Roll out team-wide.\n\nWant me to tailor a checklist template for your team? (Yes/No)`
+      : "Okay.";
   }
 
   return { status: 200, json: { route, text } };
@@ -248,14 +223,8 @@ export default (async (req: Request) => {
   const payload = await req.json().catch(() => ({}));
   try {
     const out = await processChat(payload);
-    return new Response(JSON.stringify(out.json), {
-      status: out.status,
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(JSON.stringify(out.json), { status: out.status, headers: { "content-type": "application/json" } });
   } catch (err: any) {
-    return new Response(JSON.stringify({ route: "qa", text: err?.message || "Internal error" }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(JSON.stringify({ route: "qa", text: err?.message || "Internal error" }), { status: 500, headers: { "content-type": "application/json" } });
   }
 }) as any;
